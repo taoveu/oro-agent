@@ -70,10 +70,14 @@ def terminate(status: str = "success") -> str:
 # ─── Utilities ────────────────────────────────────────────────────────────────
 
 def _pid(p: Dict) -> str:
-    """Extract product ID from a product dict."""
-    return str(
-        p.get("product_id") or p.get("id") or p.get("itemid") or ""
-    )
+    """Extract product ID from a product dict, including nested item_basic."""
+    direct = p.get("product_id") or p.get("id") or p.get("itemid")
+    if direct:
+        return str(direct)
+    # Some ORO responses nest the ID inside item_basic
+    nested = (p.get("item_basic") or {}).get("itemid") or \
+             (p.get("item_basic") or {}).get("id")
+    return str(nested) if nested else ""
 
 
 def _shop_id(p: Dict) -> str:
@@ -225,18 +229,35 @@ def _price_filter(c: Dict, problem_type: str) -> str:
     return f"0-{int(float(budget) * 1.1)}"
 
 
+def _keyword_match(kw: str, content: str) -> bool:
+    """Match keyword against content with word-boundary awareness.
+    
+    Single words use whole-word matching to avoid false positives
+    (e.g. 'car' should not match 'carton').
+    Multi-word phrases use substring matching (specific enough).
+    """
+    kw_lower = str(kw).lower().strip()
+    if not kw_lower:
+        return False
+    if " " in kw_lower:
+        # Multi-word phrase: substring match is fine
+        return kw_lower in content
+    # Single word: require whole-word match
+    return kw_lower in content.split()
+
+
 def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
     """Score a product against constraints. Higher = better match."""
     score = 0.0
     content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
 
-    # Keyword scoring
+    # Keyword scoring — whole-word aware to avoid false positives
     for kw in c.get("required_kw", []):
-        if str(kw).lower() in content:
+        if _keyword_match(kw, content):
             score += 10.0
 
     for kw in c.get("forbidden_kw", []):
-        if str(kw).lower() in content:
+        if _keyword_match(kw, content):
             score -= 15.0
 
     # Price scoring
@@ -459,12 +480,20 @@ def _strategy_voucher(
     ))
 
     if not products:
-        # Fallback: no price filter
-        result = execute_tool_call("find_product", {"q": query, "sort": "priceasc"})
+        # Fallback: search without price filter, use relevance sort (not priceasc)
+        # to avoid low-relevance cheap items polluting results.
+        # We'll sort by price ourselves in Python after retrieving relevant results.
+        result = execute_tool_call("find_product", {"q": query, "sort": "default"})
         products = result.get("result") or []
+        # Sort results by price ascending ourselves for budget-aware ranking
+        products = sorted(
+            products,
+            key=lambda x: _price_val(x) if _price_val(x) is not None else float("inf")
+        )
         think = (
-            f"The filtered search returned no results. I broadened the search "
-            f"without the price filter and found {len(products)} products. "
+            f"The price-filtered search returned no results. I broadened the search "
+            f"using relevance sort (to avoid irrelevant cheap items) and found "
+            f"{len(products)} products, then sorted by price in Python. "
             + _product_summary(products)
         )
         n[0] += 1
