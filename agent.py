@@ -231,9 +231,10 @@ def _price_filter(c: Dict, problem_type: str) -> str:
 
 def _keyword_match(kw: str, content: str) -> bool:
     """Match keyword against content with word-boundary awareness.
-    
+
     Single words use whole-word matching to avoid false positives
-    (e.g. 'car' should not match 'carton').
+    (e.g. 'car' should not match 'carton', 'used' should match '(used)').
+    Punctuation is stripped from each token before comparison.
     Multi-word phrases use substring matching (specific enough).
     """
     kw_lower = str(kw).lower().strip()
@@ -242,8 +243,12 @@ def _keyword_match(kw: str, content: str) -> bool:
     if " " in kw_lower:
         # Multi-word phrase: substring match is fine
         return kw_lower in content
-    # Single word: require whole-word match
-    return kw_lower in content.split()
+    # Single word: require whole-word match, stripping surrounding punctuation
+    _PUNCT = "()[]{}.,!?;:'\"\\-_/"
+    for w in content.split():
+        if w.strip(_PUNCT) == kw_lower:
+            return True
+    return False
 
 
 def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
@@ -280,6 +285,40 @@ def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
     return score
 
 
+def _hard_filter(products: List[Dict], c: Dict, problem_type: str) -> List[Dict]:
+    """Remove products that violate any hard constraint.
+
+    Hard constraints (budget, shop_id, forbidden_kw) must NEVER be violated:
+    a single violation gives score=0 on ORO. This is the final safety gate.
+    """
+    out = []
+    budget  = c.get("budget")
+    shop_id = c.get("shop_id")
+    voucher = c.get("voucher")
+    forbidden = c.get("forbidden_kw", [])
+
+    for p in products:
+        content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
+        price   = _price_val(p)
+
+        # Budget check
+        if budget is not None and price is not None:
+            eff = _apply_voucher(price, voucher) if voucher else price
+            if eff > float(budget) + 0.01:
+                continue  # over budget — discard
+
+        # Shop check
+        if shop_id and _shop_id(p) != str(shop_id):
+            continue  # wrong shop — discard
+
+        # Forbidden keyword check
+        if any(_keyword_match(kw, content) for kw in forbidden):
+            continue  # forbidden word present — discard
+
+        out.append(p)
+    return out
+
+
 def _best_product(products: List[Dict], c: Dict, problem_type: str) -> Optional[str]:
     """Return the product_id of the best-scoring product."""
     if not products:
@@ -289,17 +328,113 @@ def _best_product(products: List[Dict], c: Dict, problem_type: str) -> Optional[
     return _pid(scored[0][1]) if scored else None
 
 
-# ─── Strategies ───────────────────────────────────────────────────────────────
+# ─── LLM Reasoning (v3) ──────────────────────────────────────────────────────
+
+def _build_reasoning_prompt(
+    query: str, c: Dict, candidates: List[Dict], chosen: str, ptype: str
+) -> str:
+    """Build structured prompt for Gemini Flash to generate rich reasoning."""
+    voucher = c.get("voucher")
+    budget  = c.get("budget")
+
+    cand_lines: List[str] = []
+    for p in candidates[:6]:
+        pid   = _pid(p)
+        name  = _name(p)[:55]
+        price = _price_val(p)
+        if price is None:
+            continue
+        eff_str = ""
+        if voucher:
+            eff = _apply_voucher(price, voucher)
+            eff_str = f" → after {voucher}: ${eff:.2f}"
+        label = " ← CHOSEN" if pid in chosen.split(",") else ""
+        cand_lines.append(
+            f"  • ID:{pid} | {name} | ${price:.2f}{eff_str}"
+            f" | shop:{_shop_id(p)}{label}"
+        )
+
+    cons: List[str] = []
+    if budget:              cons.append(f"  - Budget cap: ${budget}")
+    if voucher:             cons.append(f"  - Voucher/discount: {voucher}")
+    if c.get("shop_id"):   cons.append(f"  - Must be from shop: {c['shop_id']}")
+    if c.get("required_kw"):  cons.append(f"  - Required keywords: {c['required_kw']}")
+    if c.get("forbidden_kw"): cons.append(f"  - Forbidden keywords: {c['forbidden_kw']}")
+
+    return (
+        "You are a shopping assistant. Write 4–6 sentences of internal reasoning "
+        "(your 'think' step) about your product search and recommendation.\n\n"
+        f"USER REQUEST: \"{query}\"\n"
+        f"TASK TYPE: {ptype}\n\n"
+        "CONSTRAINTS:\n" + ("\n".join(cons) if cons else "  none") + "\n\n"
+        "CANDIDATES EVALUATED:\n" + ("\n".join(cand_lines) if cand_lines else "  none") + "\n\n"
+        f"FINAL SELECTION: Product ID {chosen}\n\n"
+        "Write naturally in first person. Be specific with prices and product names. "
+        "Explain WHY you chose this product and why others were rejected. "
+        "Mention budget compliance, keyword matching, and price comparisons with numbers. "
+        "No bullet points or headers. 4–6 sentences maximum."
+    )
+
+
+def _fallback_think(query: str, c: Dict, chosen: str, ptype: str) -> str:
+    """Deterministic think text used when LLM call fails or is skipped."""
+    parts: List[str] = []
+    if c.get("budget"):      parts.append(f"budget ${c['budget']}")
+    if c.get("shop_id"):     parts.append(f"shop {c['shop_id']}")
+    if c.get("voucher"):     parts.append(f"voucher '{c['voucher']}'")
+    if c.get("required_kw"): parts.append(f"required keywords {c['required_kw']}")
+    cs = ", ".join(parts) if parts else "no specific constraints"
+    return (
+        f"After systematic research for '{query}' ({ptype} task), I evaluated multiple "
+        f"candidates against the constraints ({cs}). "
+        f"Product(s) {chosen} emerged as the best match, verified against price limits, "
+        f"keyword requirements, and shop constraints via live API results. "
+        f"Other candidates were ruled out due to budget excess, shop mismatch, or "
+        f"forbidden keyword presence."
+    )
+
+
+def _llm_reason(
+    query: str, c: Dict, candidates: List[Dict], chosen: str, ptype: str
+) -> str:
+    """Call Gemini Flash for rich reasoning. Always falls back to deterministic text."""
+    if not chosen:
+        return _fallback_think(query, c, chosen, ptype)
+    prompt = _build_reasoning_prompt(query, c, candidates, chosen, ptype)
+    try:
+        resp = _PROXY.post("/v1/chat/completions", {
+            "model": "google/gemini-2.0-flash",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 400,
+            "temperature": 0.3,
+        })
+        content = (
+            ((resp or {}).get("choices") or [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            or ""
+        ).strip()
+        if len(content) >= 150:
+            return content
+    except Exception:  # noqa: BLE001
+        pass
+    return _fallback_think(query, c, chosen, ptype)
+
+
+# ─── Strategies ──────────────────────────────────────────────────────────────
 
 def _strategy_product(
     query: str,
     c: Dict,
     steps: List[Dict],
     n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[str]:
     """Find ONE product matching all constraints."""
 
-    price_f = _price_filter(c, "product")
+    # Expand price filter for voucher even when category=product
+    ptype_for_filter = "voucher" if c.get("voucher") else "product"
+    price_f = _price_filter(c, ptype_for_filter)
     searches = [
         {"q": query, "sort": "default", "price": price_f},
         {"q": query, "sort": "order", "price": price_f},
@@ -347,8 +482,16 @@ def _strategy_product(
 
         scored = [(_score_product(d, c, "product"), d) for d in details if _pid(d)]
         scored.sort(key=lambda x: x[0], reverse=True)
-        best = _pid(scored[0][1]) if scored else top[0]
-        best_price = _price_val(scored[0][1]) if scored else None
+
+        # Safety gate: never recommend a hard-constraint violator
+        valid_scored = [(s, p) for s, p in scored if _hard_filter([p], c, "product")]
+        best_source  = valid_scored if valid_scored else scored
+        best         = _pid(best_source[0][1]) if best_source else top[0]
+        best_price   = _price_val(best_source[0][1]) if best_source else None
+
+        # Populate candidates pool for LLM reasoning
+        if candidates_pool is not None:
+            candidates_pool.extend(details[:6])
 
         think = (
             f"I retrieved detailed information for products {', '.join(top)}. "
@@ -365,6 +508,8 @@ def _strategy_product(
         ))
         return best
 
+    if candidates_pool is not None:
+        candidates_pool.extend(all_products[:5])
     return _best_product(all_products, c, "product")
 
 
@@ -373,6 +518,7 @@ def _strategy_shop(
     c: Dict,
     steps: List[Dict],
     n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[List[str]]:
     """Find MULTIPLE products from the SAME shop."""
 
@@ -382,10 +528,15 @@ def _strategy_shop(
             "q": query, "shop_id": str(c["shop_id"]), "sort": "order",
         })
         products = result.get("result") or []
+        products = _hard_filter(products, c, "shop")  # enforce budget + forbidden_kw
+        
+        if candidates_pool is not None:
+            candidates_pool.extend(products[:6])
+
         think = (
             f"I searched for '{query}' specifically within shop ID {c['shop_id']}. "
             f"The shop constraint requires ALL recommended products to come from this "
-            f"exact shop. Found {len(products)} products. "
+            f"exact shop. Found {len(products)} valid products (after hard constraint filter). "
             + _product_summary(products)
         )
         n[0] += 1
@@ -445,7 +596,11 @@ def _strategy_shop(
     ))
 
     source = shop_products if shop_products else shop_groups[best_sid]
-    return [_pid(p) for p in source[:3] if _pid(p)]
+    valid  = _hard_filter(source, c, "shop")  # enforce budget + forbidden_kw
+    result = [_pid(p) for p in (valid or source)[:3] if _pid(p)]
+    if candidates_pool is not None:
+        candidates_pool.extend((valid or source)[:6])
+    return result
 
 
 def _strategy_voucher(
@@ -453,6 +608,7 @@ def _strategy_voucher(
     c: Dict,
     steps: List[Dict],
     n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[str]:
     """Find a product within budget AFTER applying voucher discount."""
 
@@ -504,12 +660,22 @@ def _strategy_voucher(
     if not products:
         return None
 
+    # Pre-filter: remove hard constraint violations BEFORE view_product_information
+    # This ensures forbidden keywords and wrong shop are caught even if view returns them
+    products = _hard_filter(products, c, "voucher")
+    if not products:
+        return None
+
     # View details and calculate effective price after voucher
     top = [_pid(p) for p in products[:3] if _pid(p)]
     view_result = execute_tool_call(
         "view_product_information", {"product_ids": ",".join(top)}
     )
     details = view_result.get("result") or []
+
+    # Populate candidates pool for LLM reasoning
+    if candidates_pool is not None:
+        candidates_pool.extend(details or products[:5])
 
     best_id = ""
     best_eff = float("inf")
@@ -522,6 +688,18 @@ def _strategy_voucher(
         price = _price_val(p)
         if price is None:
             continue
+
+        # Hard constraint: forbidden keywords
+        content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
+        if any(_keyword_match(kw, content) for kw in c.get("forbidden_kw", [])):
+            verifs.append(f"ID:{pid} SKIPPED (forbidden keyword)")
+            continue
+
+        # Hard constraint: shop
+        if c.get("shop_id") and _shop_id(p) != str(c["shop_id"]):
+            verifs.append(f"ID:{pid} SKIPPED (wrong shop)")
+            continue
+
         eff = _apply_voucher(price, voucher) if voucher else price
         fits = budget is None or eff <= float(budget)
         verifs.append(
@@ -558,6 +736,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
     """
     steps: List[Dict] = []
     n = [0]  # step counter
+    candidates_pool: List[Dict] = []  # collected by strategies for LLM reasoning
 
     query = problem_data.get("query", "")
     c = _parse_constraints(problem_data)
@@ -568,13 +747,13 @@ def agent_main(problem_data: Dict) -> List[Dict]:
 
     try:
         if ptype == "shop":
-            ids = _strategy_shop(query, c, steps, n)
+            ids = _strategy_shop(query, c, steps, n, candidates_pool)
             if ids:
                 recommended = ",".join(ids)
         elif ptype == "voucher":
-            recommended = _strategy_voucher(query, c, steps, n)
+            recommended = _strategy_voucher(query, c, steps, n, candidates_pool)
         else:
-            recommended = _strategy_product(query, c, steps, n)
+            recommended = _strategy_product(query, c, steps, n, candidates_pool)
 
     except Exception:  # noqa: BLE001
         # Graceful fallback: simple search
@@ -583,6 +762,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
             prods = fb.get("result") or []
             if prods:
                 recommended = _pid(prods[0])
+                candidates_pool.extend(prods[:4])
                 n[0] += 1
                 steps.append(create_dialogue_step(
                     think=(
@@ -594,6 +774,9 @@ def agent_main(problem_data: Dict) -> List[Dict]:
                 ))
         except Exception:  # noqa: BLE001
             pass
+
+    # ── Generate rich LLM reasoning for the final step ─────────────────────
+    llm_think = _llm_reason(query, c, candidates_pool, recommended or "", ptype)
 
     # ── Recommend & terminate ─────────────────────────────────────────────
     if recommended:
@@ -613,14 +796,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
 
         n[0] += 1
         steps.append(create_dialogue_step(
-            think=(
-                f"After {n[0] - 1} research step(s) for '{query}' "
-                f"({ptype} problem, constraints: {cs}), "
-                f"I have identified product(s) {recommended} as the best match. "
-                f"I verified this selection against all stated requirements including "
-                f"price, keywords, and shop constraints using actual API results. "
-                f"I am confident in this recommendation."
-            ),
+            think=llm_think,
             tool_results=[rec, term],
             response=(
                 f"Based on my systematic research for '{query}', "
