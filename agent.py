@@ -14,7 +14,6 @@ Key optimizations:
   7. Specialized strategies per problem type: product / shop / voucher
 """
 
-import os
 import json
 import re
 from typing import Dict, List, Optional, Any, Tuple
@@ -31,11 +30,9 @@ from src.agent.proxy_client import ProxyClient
 
 _PROXY = ProxyClient(timeout=90, max_retries=2)
 
-# Model selection — strong reasoning models available on ORO
-_MODEL = os.environ.get(
-    "SANDBOX_MODEL",
-    "Qwen/Qwen3-32B-TEE",  # Best balance of speed and reasoning quality
-)
+# Model selection — strong reasoning model available on ORO
+# See: https://oroagents.com/docs/miners/inference-providers
+_MODEL = "Qwen/Qwen3-32B-TEE"
 
 MAX_REACT_STEPS = 8     # Enough for complex multi-step problems
 MAX_SEARCH_PAGES = 3    # Pages to explore if initial results insufficient
