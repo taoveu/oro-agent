@@ -1,0 +1,66 @@
+name: Submit Agent to ORO Network
+
+on:
+  push:
+    tags:
+      - 'v*'        # Trigger on version tags: v1.0, v2.1, etc.
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+    inputs:
+      model:
+        description: 'LLM model to use'
+        required: false
+        default: 'Qwen/Qwen3-32B-TEE'
+
+jobs:
+  test:
+    name: Validate Agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Python syntax
+        run: python -m py_compile agent.py
+
+      - name: Check agent_main exists
+        run: grep -q "def agent_main" agent.py
+
+      - name: Run local tests
+        run: python test_agent.py --problem all
+
+  submit:
+    name: Submit to ORO
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ORO SDK
+        run: pip install -U "oro-sdk[bittensor]"
+
+      - name: Submit agent
+        env:
+          CHUTES_API_KEY: ${{ secrets.CHUTES_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BITTENSOR_WALLET_NAME: ${{ secrets.BITTENSOR_WALLET_NAME }}
+          BITTENSOR_WALLET_HOTKEY: ${{ secrets.BITTENSOR_WALLET_HOTKEY }}
+          BITTENSOR_COLDKEY_SS58: ${{ secrets.BITTENSOR_COLDKEY_SS58 }}
+          SANDBOX_MODEL: ${{ github.event.inputs.model || 'Qwen/Qwen3-32B-TEE' }}
+        run: |
+          echo "🚀 Submitting agent..."
+          bash scripts/submit.sh agent.py
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Agent submitted successfully!"
+          echo "Monitor at: https://oroagents.com/leaderboard"
