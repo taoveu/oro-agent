@@ -1192,18 +1192,50 @@ def _strategy_voucher(
         # Shop-type voucher: find common shop first
         shop_id = ""
         if voucher_type == "shop":
-            shop_sets: List[set] = []
+            # Collect products per sub-query to allow scoring shops later
+            subq_all_prods: List[List[Dict]] = []
+            subq_shop_sets: List[set] = []
             for sq in sub_queries:
-                r = execute_tool_call("find_product", {"q": sq, "sort": "default"})
+                clean_sq = _clean_search_query(sq)
+                r = execute_tool_call("find_product", {"q": clean_sq, "sort": "default"})
                 prods = r.get("result") or []
+                subq_all_prods.append(prods)
                 shops = {_shop_id(p) for p in prods if _shop_id(p)}
                 if shops:
-                    shop_sets.append(shops)
-            if shop_sets:
-                common = shop_sets[0].copy()
-                for s in shop_sets[1:]:
+                    subq_shop_sets.append(shops)
+
+            if subq_shop_sets:
+                common = subq_shop_sets[0].copy()
+                for s in subq_shop_sets[1:]:
                     common &= s
-                shop_id = list(common)[0] if common else ""
+
+                if len(common) == 1:
+                    # Only one common shop — straightforward
+                    shop_id = list(common)[0]
+                elif len(common) > 1:
+                    # Multiple common shops: pick the one whose products are
+                    # most RELEVANT to each sub-query (query-term score, not sold_count)
+                    best_shop, best_score = "", -1.0
+                    for sid in sorted(common):  # sorted for determinism
+                        total_relevance = 0.0
+                        for sq, prods in zip(sub_queries, subq_all_prods):
+                            shop_prods = [p for p in prods if _shop_id(p) == sid]
+                            if not shop_prods:
+                                continue
+                            # Score best product of this shop for this sub-query
+                            sq_terms = _extract_query_terms(sq)
+                            best_rel = 0.0
+                            for p in shop_prods:
+                                content = _searchable(p)
+                                rel = sum(
+                                    3.0 for t in sq_terms if _keyword_match(t, content)
+                                )
+                                best_rel = max(best_rel, rel)
+                            total_relevance += best_rel
+                        if total_relevance > best_score:
+                            best_score = total_relevance
+                            best_shop = sid
+                    shop_id = best_shop
 
             think = (
                 f"Shop voucher detected for {len(sub_queries)} items. "
