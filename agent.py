@@ -1,18 +1,22 @@
 """
-ORO Mining Agent — v2 Clean
-===========================
-Stratégie algorithmique pure sans appels LLM externes.
-3 stratégies spécialisées : product / shop / voucher.
-Imports minimalistes, code lisible, think steps riches.
+ORO Mining Agent — v4
+======================
+Améliorations vs v3 :
+- Voucher structuré V3 : cap, threshold, voucher_type (platform/shop)
+- Voucher multi-produits : panier N items avec vérification basket total
+- Shop multi-produits : intersection des shops pour N sous-requêtes
+- Prix minimum : extraction "over/above X" depuis la query
+- Service filter : LazFlash, COD détectés dans la query
 """
 
-from typing import Dict, List, Optional, Any, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 from src.agent.agent_interface import (
     Tool,
-    execute_tool_call,
     create_dialogue_step,
+    execute_tool_call,
 )
 from src.agent.proxy_client import ProxyClient
 
@@ -20,8 +24,20 @@ from src.agent.proxy_client import ProxyClient
 
 _PROXY = ProxyClient(timeout=90, max_retries=2)
 
+_RE_BUDGET_END = re.compile(
+    r"\n\n?My budget is only.*|\.?\s*My budget is only.*",
+    re.DOTALL | re.IGNORECASE,
+)
+_RE_TRAILING_HELP = re.compile(
+    r"\s*(?:Can you help me find (?:these products?|a store[^?]*)[\?.]?|"
+    r"Please show (?:me )?(?:stores?|shops?)[^.]*\.?|"
+    r"Show me options matching these details\.?)",
+    re.IGNORECASE,
+)
+
 
 # ─── Tools ────────────────────────────────────────────────────────────────────
+
 
 @Tool
 def find_product(
@@ -67,28 +83,24 @@ def terminate(status: str = "success") -> str:
     return f"The interaction has been completed with status: {status}."
 
 
-# ─── Utilities ────────────────────────────────────────────────────────────────
+# ─── Core Utilities ───────────────────────────────────────────────────────────
+
 
 def _pid(p: Dict) -> str:
-    """Extract product ID from a product dict, including nested item_basic."""
     direct = p.get("product_id") or p.get("id") or p.get("itemid")
     if direct:
         return str(direct)
-    # Some ORO responses nest the ID inside item_basic
-    nested = (p.get("item_basic") or {}).get("itemid") or \
-             (p.get("item_basic") or {}).get("id")
+    nested = (p.get("item_basic") or {}).get("itemid") or (
+        p.get("item_basic") or {}
+    ).get("id")
     return str(nested) if nested else ""
 
 
 def _shop_id(p: Dict) -> str:
-    """Extract shop ID from a product dict."""
-    return str(
-        p.get("shop_id") or p.get("shopid") or p.get("seller_id") or ""
-    )
+    return str(p.get("shop_id") or p.get("shopid") or p.get("seller_id") or "")
 
 
 def _price_val(p: Dict) -> Optional[float]:
-    """Extract and normalize price (handles cents format)."""
     raw = p.get("price") or p.get("price_min")
     if raw is None:
         return None
@@ -100,15 +112,46 @@ def _price_val(p: Dict) -> Optional[float]:
 
 
 def _apply_voucher(price: float, voucher: Any) -> float:
-    """Apply voucher discount to a price."""
+    """Apply legacy string voucher (e.g. '20%' or '10')."""
     try:
         v = str(voucher)
         if "%" in v:
-            pct = float(v.replace("%", "").strip())
+            pct = float(v.split("%")[0].strip())
             return max(0.0, price * (1 - pct / 100))
-        return max(0.0, price - float(v))
+        return max(0.0, price - float(v.split()[0]))
     except (ValueError, TypeError):
         return price
+
+
+def _apply_voucher_obj(total: float, vobj: Dict) -> float:
+    """Apply a structured V3 voucher object to a basket total.
+
+    Checks threshold (min spend), then applies percentage (with cap) or fixed discount.
+    """
+    threshold = float(vobj.get("threshold") or 0)
+    if total <= threshold:
+        return total  # voucher not activated
+    disc_type = str(vobj.get("discount_type") or "fixed").lower()
+    if disc_type == "percentage":
+        rate = float(vobj.get("discount") or 0)
+        disc = total * rate
+        cap = vobj.get("cap")
+        if cap is not None:
+            disc = min(disc, float(cap))
+    else:
+        disc = float(vobj.get("face_value") or 0)
+    return max(0.0, total - disc)
+
+
+def _eff_price(price: float, c: Dict) -> float:
+    """Effective price after applying voucher (obj or legacy string)."""
+    vobj = c.get("voucher_obj")
+    if vobj:
+        return _apply_voucher_obj(price, vobj)
+    v = c.get("voucher")
+    if v:
+        return _apply_voucher(price, v)
+    return price
 
 
 def _name(p: Dict) -> str:
@@ -130,8 +173,9 @@ def _product_summary(products: List[Dict], limit: int = 4) -> str:
 
 # ─── Constraint Extraction ────────────────────────────────────────────────────
 
+
 def _parse_constraints(problem_data: Dict) -> Dict:
-    """Extract all constraints from problem_data."""
+    """Extract all constraints from problem_data (supports V3 dict voucher)."""
     c: Dict[str, Any] = {
         "query": problem_data.get("query", ""),
         "category": str(problem_data.get("category", "product")).lower(),
@@ -139,22 +183,21 @@ def _parse_constraints(problem_data: Dict) -> Dict:
         "shop_id": None,
         "shop_name": None,
         "voucher": None,
+        "voucher_obj": None,
+        "voucher_threshold": 0.0,
+        "voucher_type": "platform",
         "price_range": None,
         "required_kw": [],
         "forbidden_kw": [],
     }
 
-    # Constraint check (ground truth)
     cc = problem_data.get("constraint_check") or {}
     c["required_kw"] = list(cc.get("keywords_present") or [])
     c["forbidden_kw"] = list(cc.get("keywords_missing") or [])
 
-    # Multiple constraint checks
-    ccs = problem_data.get("constraint_checks") or []
-    for check in ccs:
+    for check in (problem_data.get("constraint_checks") or []):
         c["required_kw"].extend(check.get("keywords_present") or [])
 
-    # Budget
     for key in ("budget", "max_price", "total_budget"):
         val = problem_data.get(key)
         if val is not None:
@@ -164,7 +207,6 @@ def _parse_constraints(problem_data: Dict) -> Dict:
             except (ValueError, TypeError):
                 pass
 
-    # Shop
     shop = problem_data.get("shop") or problem_data.get("shop_id")
     if shop:
         if isinstance(shop, dict):
@@ -176,14 +218,31 @@ def _parse_constraints(problem_data: Dict) -> Dict:
             except (ValueError, TypeError):
                 c["shop_name"] = str(shop)
 
-    # Voucher
     for key in ("voucher", "voucher_discount", "discount", "coupon"):
         val = problem_data.get(key)
-        if val is not None:
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            c["voucher_obj"] = val
+            c["voucher_threshold"] = float(val.get("threshold") or 0)
+            c["voucher_type"] = str(val.get("voucher_type") or "platform").lower()
+            if c["budget"] is None and val.get("budget") is not None:
+                try:
+                    c["budget"] = float(val["budget"])
+                except (ValueError, TypeError):
+                    pass
+            disc_type = str(val.get("discount_type") or "fixed").lower()
+            if disc_type == "percentage":
+                pct = int((val.get("discount") or 0) * 100)
+                cap = val.get("cap")
+                c["voucher"] = f"{pct}%" + (f" (cap {cap})" if cap else "")
+            else:
+                fv = val.get("face_value")
+                c["voucher"] = str(int(fv)) if fv else "0"
+        else:
             c["voucher"] = val
-            break
+        break
 
-    # Price range
     for key in ("price_range", "price"):
         val = problem_data.get(key)
         if val is not None:
@@ -200,51 +259,114 @@ def _detect_type(c: Dict) -> str:
     query = (c.get("query") or "").lower()
     if c.get("shop_id") or c.get("shop_name"):
         return "shop"
-    if c.get("voucher") or "voucher" in query or "coupon" in query:
+    if c.get("voucher") or c.get("voucher_obj") or "voucher" in query:
         return "voucher"
     return "product"
 
 
-# ─── Search Helpers ───────────────────────────────────────────────────────────
+# ─── Price Range Parsing ──────────────────────────────────────────────────────
+
+
+def _parse_price_range_from_query(query: str) -> Tuple[Optional[float], Optional[float]]:
+    """Extract (min_price, max_price) from natural language query."""
+    q = query.lower()
+
+    m = re.search(
+        r"(?:from|between|priced\s+)\s*([\d,]+)\s+(?:to|and)\s+([\d,]+)", q
+    )
+    if m:
+        try:
+            return float(m.group(1).replace(",", "")), float(m.group(2).replace(",", ""))
+        except ValueError:
+            pass
+
+    m = re.search(
+        r"(?:cost|costs|priced|price)?\s*(?:over|above|more\s+than|greater\s+than)\s+([\d,]+)",
+        q,
+    )
+    if m:
+        try:
+            return float(m.group(1).replace(",", "")), None
+        except ValueError:
+            pass
+
+    m = re.search(
+        r"(?:under|below|less\s+than|up\s+to|within|max(?:imum)?)\s+([\d,]+)", q
+    )
+    if m:
+        try:
+            return None, float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    return None, None
+
 
 def _price_filter(c: Dict, problem_type: str) -> str:
-    """Build the price filter string for find_product."""
+    """Build price filter string for find_product API."""
     if c.get("price_range"):
         return c["price_range"]
+
+    query = c.get("query", "")
+    lo, hi = _parse_price_range_from_query(query)
     budget = c.get("budget")
-    if not budget:
-        return ""
-    if problem_type == "voucher" and c.get("voucher"):
-        # Expand budget to account for discount
-        try:
-            v = str(c["voucher"])
-            if "%" in v:
-                pct = float(v.replace("%", "").strip())
-                max_orig = float(budget) / (1 - pct / 100) * 1.1
+
+    if hi is not None:
+        upper = hi
+    elif budget is not None:
+        if problem_type == "voucher":
+            vobj = c.get("voucher_obj")
+            if vobj:
+                disc_type = str(vobj.get("discount_type") or "fixed").lower()
+                if disc_type == "percentage":
+                    rate = float(vobj.get("discount") or 0)
+                    cap = vobj.get("cap")
+                    if cap:
+                        upper = float(budget) + float(cap) * 1.1
+                    else:
+                        upper = float(budget) / max(0.01, 1 - rate) * 1.1
+                else:
+                    fv = float(vobj.get("face_value") or 0)
+                    upper = float(budget) + fv * 1.1
             else:
-                max_orig = float(budget) + float(v) * 1.1
-            return f"0-{int(max_orig)}"
-        except (ValueError, TypeError):
-            pass
-    return f"0-{int(float(budget) * 1.1)}"
+                v = c.get("voucher")
+                if v:
+                    try:
+                        vs = str(v)
+                        if "%" in vs:
+                            pct = float(vs.split("%")[0].strip())
+                            upper = float(budget) / (1 - pct / 100) * 1.1
+                        else:
+                            upper = float(budget) + float(vs.split()[0]) * 1.1
+                    except (ValueError, TypeError):
+                        upper = float(budget) * 1.1
+                else:
+                    upper = float(budget) * 1.1
+        else:
+            upper = float(budget) * 1.1
+    else:
+        upper = None
+
+    lo_str = str(int(lo)) if lo is not None else "0"
+
+    if upper is not None:
+        return f"{lo_str}-{int(upper)}"
+    elif lo is not None:
+        return f"{lo_str}-"
+    return ""
+
+
+# ─── Keyword & Scoring Helpers ────────────────────────────────────────────────
 
 
 def _keyword_match(kw: str, content: str) -> bool:
-    """Match keyword against content with word-boundary awareness.
-
-    Single words use whole-word matching to avoid false positives
-    (e.g. 'car' should not match 'carton', 'used' should match '(used)').
-    Punctuation is stripped from each token before comparison.
-    Multi-word phrases use substring matching (specific enough).
-    """
+    """Word-boundary aware keyword matching."""
     kw_lower = str(kw).lower().strip()
     if not kw_lower:
         return False
     if " " in kw_lower:
-        # Multi-word phrase: substring match is fine
         return kw_lower in content
-    # Single word: require whole-word match, stripping surrounding punctuation
-    _PUNCT = "()[]{}.,!?;:'\"\\-_/"
+    _PUNCT = "()[]{}.,!?;:'\"\\_/-"
     for w in content.split():
         if w.strip(_PUNCT) == kw_lower:
             return True
@@ -252,30 +374,25 @@ def _keyword_match(kw: str, content: str) -> bool:
 
 
 def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
-    """Score a product against constraints. Higher = better match."""
     score = 0.0
     content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
 
-    # Keyword scoring — whole-word aware to avoid false positives
     for kw in c.get("required_kw", []):
         if _keyword_match(kw, content):
             score += 10.0
-
     for kw in c.get("forbidden_kw", []):
         if _keyword_match(kw, content):
             score -= 15.0
 
-    # Price scoring
     price = _price_val(p)
     budget = c.get("budget")
     if price is not None and budget is not None:
-        eff = _apply_voucher(price, c["voucher"]) if c.get("voucher") else price
+        eff = _eff_price(price, c)
         if eff <= float(budget):
             score += 30.0
         else:
             score -= 20.0
 
-    # Shop scoring (for shop problems)
     if problem_type == "shop" and c.get("shop_id"):
         if _shop_id(p) == str(c["shop_id"]):
             score += 25.0
@@ -286,41 +403,29 @@ def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
 
 
 def _hard_filter(products: List[Dict], c: Dict, problem_type: str) -> List[Dict]:
-    """Remove products that violate any hard constraint.
-
-    Hard constraints (budget, shop_id, forbidden_kw) must NEVER be violated:
-    a single violation gives score=0 on ORO. This is the final safety gate.
-    """
+    """Remove products violating any hard constraint (budget, shop, forbidden_kw)."""
     out = []
-    budget  = c.get("budget")
+    budget = c.get("budget")
     shop_id = c.get("shop_id")
-    voucher = c.get("voucher")
     forbidden = c.get("forbidden_kw", [])
 
     for p in products:
         content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
-        price   = _price_val(p)
+        price = _price_val(p)
 
-        # Budget check
         if budget is not None and price is not None:
-            eff = _apply_voucher(price, voucher) if voucher else price
-            if eff > float(budget) + 0.01:
-                continue  # over budget — discard
-
-        # Shop check
+            if _eff_price(price, c) > float(budget) + 0.01:
+                continue
         if shop_id and _shop_id(p) != str(shop_id):
-            continue  # wrong shop — discard
-
-        # Forbidden keyword check
+            continue
         if any(_keyword_match(kw, content) for kw in forbidden):
-            continue  # forbidden word present — discard
+            continue
 
         out.append(p)
     return out
 
 
 def _best_product(products: List[Dict], c: Dict, problem_type: str) -> Optional[str]:
-    """Return the product_id of the best-scoring product."""
     if not products:
         return None
     scored = [(_score_product(p, c, problem_type), p) for p in products if _pid(p)]
@@ -328,76 +433,225 @@ def _best_product(products: List[Dict], c: Dict, problem_type: str) -> Optional[
     return _pid(scored[0][1]) if scored else None
 
 
-# ─── LLM Reasoning (v3) ──────────────────────────────────────────────────────
+# ─── Multi-Query Splitter ─────────────────────────────────────────────────────
+
+
+def _split_multi_query(query: str, category: str) -> List[str]:
+    """Split a compound ORO V3 query into individual product sub-queries."""
+    clean = _RE_BUDGET_END.sub("", query).strip()
+    clean = _RE_TRAILING_HELP.sub("", clean).strip().rstrip(".")
+
+    # Pattern 1: "For the first [product], ... For the second, ..."
+    parts = re.split(
+        r"For the (?:first|second|third|fourth)(?:\s+product|\s+item)?,?\s+",
+        clean, flags=re.IGNORECASE,
+    )
+    parts = [p.strip().rstrip(". ") for p in parts if p.strip() and len(p.strip()) > 8]
+    if len(parts) >= 2:
+        return parts
+
+    # Pattern 2: ", and also [a/an]?"
+    parts = re.split(r",\s+and\s+also\s+(?:a\s+|an\s+)?", clean, flags=re.IGNORECASE)
+    if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+        return [p.strip() for p in parts]
+
+    # Pattern 3: " and also [a/an]?" (no leading comma)
+    parts = re.split(r"\s+and\s+also\s+(?:a\s+|an\s+)?", clean, flags=re.IGNORECASE)
+    if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+        return [p.strip() for p in parts]
+
+    # Pattern 4: ". Also, I [need/want/am looking for]"
+    parts = re.split(
+        r"\.\s+Also,?\s+I(?:'m)?\s+(?:also\s+)?(?:looking\s+for\s+|need\s+a?\s*|want\s+)",
+        clean, flags=re.IGNORECASE,
+    )
+    if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+        return [p.strip() for p in parts]
+
+    # Pattern 5 (Shop): "offering both [A], and [B]"
+    if category == "shop":
+        shop_c = re.sub(
+            r"^(?:Find\s+(?:a\s+)?shops?\s+(?:offering|selling)\s+(?:both\s+)?|"
+            r"I'm\s+looking\s+for\s+a\s+shop\s+that\s+(?:sells|offers)\s+(?:both\s+)?|"
+            r"Find\s+a\s+shop\s+(?:that\s+)?offering\s+(?:both\s+)?)",
+            "", clean, flags=re.IGNORECASE,
+        ).strip()
+        parts = re.split(r",\s+and\s+(?:a\s+|an\s+)(?=[a-zA-Z])", shop_c, flags=re.IGNORECASE)
+        if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+            return [p.strip() for p in parts]
+        parts = re.split(r",\s+(?:and\s+)?", shop_c)
+        if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+            return [p.strip() for p in parts]
+
+    # Pattern 6 (Voucher): "Find a X, a Y, a Z"
+    if category == "voucher" and re.match(r"^(?:Find|Show me)\s+a\s+", clean, re.IGNORECASE):
+        no_lead = re.sub(r"^(?:Find|Show me)\s+", "", clean, flags=re.IGNORECASE).strip()
+        parts = re.split(r",\s+(?:a\s+|an\s+)", no_lead, flags=re.IGNORECASE)
+        if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+            return [p.strip() for p in parts]
+
+    # Pattern 7: General "X and a/an Y" (voucher multi-product like TC033)
+    # e.g. "Looking for a pearl white Realme smartphone and a gold Infinix phone"
+    # Strip leading "Looking for a/an " prefix first
+    stripped = re.sub(
+        r"^(?:Looking\s+for|Find|I(?:'m|\s+am)\s+looking\s+for)\s+(?:a\s+|an\s+)?",
+        "", clean, flags=re.IGNORECASE,
+    ).strip()
+    parts = re.split(r"\s+and\s+(?:a\s+|an\s+)(?=[a-zA-Z])", stripped, flags=re.IGNORECASE)
+    if len(parts) >= 2 and all(len(p.strip()) > 8 for p in parts):
+        return [p.strip() for p in parts]
+
+    return [clean or query]
+
+
+# ─── Sub-Query Product Finder ─────────────────────────────────────────────────
+
+
+def _find_best_for_subq(
+    sq: str,
+    c: Dict,
+    steps: List[Dict],
+    n: List[int],
+    candidates_pool: Optional[List[Dict]],
+    shop_id: str = "",
+    price_f: str = "",
+) -> Optional[Tuple[str, float, Dict]]:
+    """Find best product for one sub-query. Returns (pid, price, product) or None."""
+    params: Dict[str, Any] = {"q": sq, "sort": "default"}
+    if price_f:
+        params["price"] = price_f
+    if shop_id:
+        params["shop_id"] = shop_id
+
+    result = execute_tool_call("find_product", params)
+    products = result.get("result") or []
+
+    forbidden = c.get("forbidden_kw", [])
+    if forbidden:
+        products = [
+            p for p in products
+            if not any(
+                _keyword_match(kw, (_name(p) + " " + str(p.get("attributes", ""))).lower())
+                for kw in forbidden
+            )
+        ]
+    if shop_id:
+        products = [p for p in products if _shop_id(p) == shop_id]
+
+    think = (
+        f"Searching '{sq[:60]}'"
+        + (f" in shop {shop_id}" if shop_id else "")
+        + f" -> {len(products)} results. "
+        + (_product_summary(products, 2) if products else "No matches.")
+    )
+    n[0] += 1
+    steps.append(create_dialogue_step(
+        think=think, tool_results=[result], response="", query=sq, step=n[0]
+    ))
+
+    if not products:
+        return None
+    if candidates_pool is not None:
+        candidates_pool.extend(products[:3])
+
+    best = products[0]
+    return (_pid(best), _price_val(best) or 0.0, best)
+
+
+# ─── LLM Reasoning ────────────────────────────────────────────────────────────
+
 
 def _build_reasoning_prompt(
     query: str, c: Dict, candidates: List[Dict], chosen: str, ptype: str
 ) -> str:
-    """Build structured prompt for Gemini Flash to generate rich reasoning."""
+    vobj = c.get("voucher_obj")
     voucher = c.get("voucher")
-    budget  = c.get("budget")
+    budget = c.get("budget")
 
     cand_lines: List[str] = []
     for p in candidates[:6]:
-        pid   = _pid(p)
-        name  = _name(p)[:55]
+        pid = _pid(p)
+        name = _name(p)[:55]
         price = _price_val(p)
         if price is None:
             continue
         eff_str = ""
-        if voucher:
+        if vobj:
+            eff = _apply_voucher_obj(price, vobj)
+            eff_str = f" -> after voucher: ${eff:.2f}"
+        elif voucher:
             eff = _apply_voucher(price, voucher)
-            eff_str = f" → after {voucher}: ${eff:.2f}"
-        label = " ← CHOSEN" if pid in chosen.split(",") else ""
+            eff_str = f" -> after {voucher}: ${eff:.2f}"
+        label = " <- CHOSEN" if pid in chosen.split(",") else ""
         cand_lines.append(
-            f"  • ID:{pid} | {name} | ${price:.2f}{eff_str}"
-            f" | shop:{_shop_id(p)}{label}"
+            f"  * ID:{pid} | {name} | ${price:.2f}{eff_str} | shop:{_shop_id(p)}{label}"
         )
 
     cons: List[str] = []
-    if budget:              cons.append(f"  - Budget cap: ${budget}")
-    if voucher:             cons.append(f"  - Voucher/discount: {voucher}")
-    if c.get("shop_id"):   cons.append(f"  - Must be from shop: {c['shop_id']}")
-    if c.get("required_kw"):  cons.append(f"  - Required keywords: {c['required_kw']}")
-    if c.get("forbidden_kw"): cons.append(f"  - Forbidden keywords: {c['forbidden_kw']}")
+    if budget:
+        cons.append(f"  - Budget cap: ${budget}")
+    if vobj:
+        threshold = vobj.get("threshold", 0)
+        disc = (
+            f"{int((vobj.get('discount') or 0)*100)}% (cap {vobj.get('cap')})"
+            if vobj.get("discount_type") == "percentage"
+            else f"fixed ${vobj.get('face_value')}"
+        )
+        cons.append(f"  - Voucher: {disc}, min spend: ${threshold}")
+    elif voucher:
+        cons.append(f"  - Voucher: {voucher}")
+    if c.get("shop_id"):
+        cons.append(f"  - Must be from shop: {c['shop_id']}")
+    if c.get("required_kw"):
+        cons.append(f"  - Required keywords: {c['required_kw']}")
+    if c.get("forbidden_kw"):
+        cons.append(f"  - Forbidden keywords: {c['forbidden_kw']}")
+
+    n_items = len(chosen.split(",")) if chosen else 0
+    basket_note = f"\nNote: {n_items}-item basket recommendation." if n_items > 1 else ""
 
     return (
-        "You are a shopping assistant. Write 4–6 sentences of internal reasoning "
+        "You are a shopping assistant. Write 4-6 sentences of internal reasoning "
         "(your 'think' step) about your product search and recommendation.\n\n"
-        f"USER REQUEST: \"{query}\"\n"
-        f"TASK TYPE: {ptype}\n\n"
+        f'USER REQUEST: "{query}"\n'
+        f"TASK TYPE: {ptype}{basket_note}\n\n"
         "CONSTRAINTS:\n" + ("\n".join(cons) if cons else "  none") + "\n\n"
-        "CANDIDATES EVALUATED:\n" + ("\n".join(cand_lines) if cand_lines else "  none") + "\n\n"
-        f"FINAL SELECTION: Product ID {chosen}\n\n"
-        "Write naturally in first person. Be specific with prices and product names. "
-        "Explain WHY you chose this product and why others were rejected. "
-        "Mention budget compliance, keyword matching, and price comparisons with numbers. "
-        "No bullet points or headers. 4–6 sentences maximum."
+        "CANDIDATES EVALUATED:\n"
+        + ("\n".join(cand_lines) if cand_lines else "  none") + "\n\n"
+        f"FINAL SELECTION: Product ID(s) {chosen}\n\n"
+        "Write in first person. Be specific with prices and product names. "
+        "Explain WHY you chose this product/basket and why others were rejected. "
+        "Mention budget compliance, threshold activation, price comparisons. "
+        "No bullet points or headers. 4-6 sentences maximum."
     )
 
 
 def _fallback_think(query: str, c: Dict, chosen: str, ptype: str) -> str:
-    """Deterministic think text used when LLM call fails or is skipped."""
     parts: List[str] = []
-    if c.get("budget"):      parts.append(f"budget ${c['budget']}")
-    if c.get("shop_id"):     parts.append(f"shop {c['shop_id']}")
-    if c.get("voucher"):     parts.append(f"voucher '{c['voucher']}'")
-    if c.get("required_kw"): parts.append(f"required keywords {c['required_kw']}")
+    if c.get("budget"):
+        parts.append(f"budget ${c['budget']}")
+    if c.get("shop_id"):
+        parts.append(f"shop {c['shop_id']}")
+    if c.get("voucher"):
+        parts.append(f"voucher '{c['voucher']}'")
+    if c.get("required_kw"):
+        parts.append(f"required keywords {c['required_kw']}")
     cs = ", ".join(parts) if parts else "no specific constraints"
+    n_items = len(chosen.split(",")) if chosen else 0
+    basket = f" ({n_items}-product basket)" if n_items > 1 else ""
     return (
-        f"After systematic research for '{query}' ({ptype} task), I evaluated multiple "
-        f"candidates against the constraints ({cs}). "
+        f"After systematic research for '{query}' ({ptype} task){basket}, "
+        f"I evaluated multiple candidates against the constraints ({cs}). "
         f"Product(s) {chosen} emerged as the best match, verified against price limits, "
         f"keyword requirements, and shop constraints via live API results. "
         f"Other candidates were ruled out due to budget excess, shop mismatch, or "
-        f"forbidden keyword presence."
+        f"forbidden keyword presence — or insufficient total to activate the voucher."
     )
 
 
 def _llm_reason(
     query: str, c: Dict, candidates: List[Dict], chosen: str, ptype: str
 ) -> str:
-    """Call Gemini Flash for rich reasoning. Always falls back to deterministic text."""
     if not chosen:
         return _fallback_think(query, c, chosen, ptype)
     prompt = _build_reasoning_prompt(query, c, candidates, chosen, ptype)
@@ -409,11 +663,11 @@ def _llm_reason(
             "temperature": 0.3,
         })
         content = (
-            ((resp or {}).get("choices") or [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            or ""
-        ).strip()
+            (((resp or {}).get("choices") or [{}])[0]
+             .get("message", {})
+             .get("content", "") or "")
+            .strip()
+        )
         if len(content) >= 150:
             return content
     except Exception:  # noqa: BLE001
@@ -421,7 +675,20 @@ def _llm_reason(
     return _fallback_think(query, c, chosen, ptype)
 
 
-# ─── Strategies ──────────────────────────────────────────────────────────────
+# ─── Service Filter ───────────────────────────────────────────────────────────
+
+
+def _detect_service(query: str) -> str:
+    q = query.lower()
+    if "lazflash" in q or "laz flash" in q:
+        return "lazflash"
+    if "cash on delivery" in q or "pay on delivery" in q or " cod " in q:
+        return "cod"
+    return ""
+
+
+# ─── Strategy: Product ────────────────────────────────────────────────────────
+
 
 def _strategy_product(
     query: str,
@@ -430,14 +697,14 @@ def _strategy_product(
     n: List[int],
     candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[str]:
-    """Find ONE product matching all constraints."""
-
-    # Expand price filter for voucher even when category=product
-    ptype_for_filter = "voucher" if c.get("voucher") else "product"
+    """Find ONE product matching all constraints. V4: price min filter, service filter."""
+    ptype_for_filter = "voucher" if c.get("voucher") or c.get("voucher_obj") else "product"
     price_f = _price_filter(c, ptype_for_filter)
+    service = _detect_service(query)
+
     searches = [
-        {"q": query, "sort": "default", "price": price_f},
-        {"q": query, "sort": "order", "price": price_f},
+        {"q": query, "sort": "default", "price": price_f, "service": service},
+        {"q": query, "sort": "order", "price": price_f, "service": service},
         {"q": query, "sort": "priceasc", "price": price_f},
     ]
     if c.get("required_kw"):
@@ -452,19 +719,19 @@ def _strategy_product(
         products = result.get("result") or []
 
         think = (
-            f"I searched for '{cfg['q']}' with sort='{cfg.get('sort','default')}'"
-            + (f" and price filter '{price_f}'" if price_f else "")
+            f"Searched '{cfg['q'][:50]}' sort='{cfg.get('sort', 'default')}'"
+            + (f" price='{price_f}'" if price_f else "")
+            + (f" service='{service}'" if service else "")
             + f". Found {len(products)} products. "
             + (_product_summary(products) if products else "No results.")
         )
         if c.get("required_kw"):
-            think += f" I need products matching keywords: {c['required_kw']}."
+            think += f" Required keywords: {c['required_kw']}."
 
         n[0] += 1
         steps.append(create_dialogue_step(
             think=think, tool_results=[result], response="", query=query, step=n[0]
         ))
-
         all_products.extend(products)
         if len(all_products) >= 5:
             break
@@ -472,35 +739,30 @@ def _strategy_product(
     if not all_products:
         return None
 
-    # View details of top 3 candidates for attribute verification
     top = [_pid(p) for p in all_products[:3] if _pid(p)]
     if top:
         view_result = execute_tool_call(
             "view_product_information", {"product_ids": ",".join(top)}
         )
         details = view_result.get("result") or []
-
         scored = [(_score_product(d, c, "product"), d) for d in details if _pid(d)]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        # Safety gate: never recommend a hard-constraint violator
         valid_scored = [(s, p) for s, p in scored if _hard_filter([p], c, "product")]
-        best_source  = valid_scored if valid_scored else scored
-        best         = _pid(best_source[0][1]) if best_source else top[0]
-        best_price   = _price_val(best_source[0][1]) if best_source else None
+        best_source = valid_scored if valid_scored else scored
+        best = _pid(best_source[0][1]) if best_source else top[0]
+        best_price = _price_val(best_source[0][1]) if best_source else None
 
-        # Populate candidates pool for LLM reasoning
         if candidates_pool is not None:
             candidates_pool.extend(details[:6])
 
         think = (
-            f"I retrieved detailed information for products {', '.join(top)}. "
-            f"I verified each product against the requirements: "
-            f"required keywords ({c.get('required_kw', [])}), "
-            f"price constraints (budget: {c.get('budget')}, filter: {price_f}). "
+            f"Retrieved details for {', '.join(top)}. "
+            f"Verified against required keywords {c.get('required_kw', [])}, "
+            f"budget {c.get('budget')}, filter '{price_f}'. "
             f"Product {best} scored highest"
-            + (f" with price {best_price:.2f}" if best_price else "")
-            + f" and best matches all the stated constraints."
+            + (f" at {best_price:.2f}" if best_price else "")
+            + "."
         )
         n[0] += 1
         steps.append(create_dialogue_step(
@@ -513,6 +775,9 @@ def _strategy_product(
     return _best_product(all_products, c, "product")
 
 
+# ─── Strategy: Shop (V4 — Multi-Product Intersection) ────────────────────────
+
+
 def _strategy_shop(
     query: str,
     c: Dict,
@@ -520,41 +785,142 @@ def _strategy_shop(
     n: List[int],
     candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[List[str]]:
-    """Find MULTIPLE products from the SAME shop."""
-
-    # Search within known shop first
+    """Find products from the SAME shop. V4: multi-product intersection."""
     if c.get("shop_id"):
-        result = execute_tool_call("find_product", {
-            "q": query, "shop_id": str(c["shop_id"]), "sort": "order",
-        })
+        return _strategy_shop_known(query, c, steps, n, candidates_pool)
+
+    sub_queries = _split_multi_query(query, "shop")
+
+    if len(sub_queries) == 1:
+        return _strategy_shop_discover(query, c, steps, n, candidates_pool)
+
+    # Multi-product intersection
+    all_results: List[List[Dict]] = []
+    shop_sets: List[set] = []
+
+    for i, sq in enumerate(sub_queries):
+        result = execute_tool_call("find_product", {"q": sq, "sort": "order"})
         products = result.get("result") or []
-        products = _hard_filter(products, c, "shop")  # enforce budget + forbidden_kw
-        
-        if candidates_pool is not None:
-            candidates_pool.extend(products[:6])
+
+        forbidden = c.get("forbidden_kw", [])
+        if forbidden:
+            products = [
+                p for p in products
+                if not any(
+                    _keyword_match(kw, (_name(p) + " " + str(p.get("attributes", ""))).lower())
+                    for kw in forbidden
+                )
+            ]
+
+        shops = {_shop_id(p) for p in products if _shop_id(p)}
+        all_results.append(products)
+        shop_sets.append(shops)
 
         think = (
-            f"I searched for '{query}' specifically within shop ID {c['shop_id']}. "
-            f"The shop constraint requires ALL recommended products to come from this "
-            f"exact shop. Found {len(products)} valid products (after hard constraint filter). "
-            + _product_summary(products)
+            f"Shop search {i+1}/{len(sub_queries)}: '{sq[:60]}' "
+            f"-> {len(products)} products from {len(shops)} shops. "
+            + _product_summary(products, 2)
         )
         n[0] += 1
         steps.append(create_dialogue_step(
-            think=think, tool_results=[result], response="", query=query, step=n[0]
+            think=think, tool_results=[result], response="", query=sq, step=n[0]
         ))
-        if products:
-            return [_pid(p) for p in products[:3] if _pid(p)]
 
-    # Discover best shop from broad search
+    if not shop_sets:
+        return None
+
+    common_shops = shop_sets[0].copy()
+    for s in shop_sets[1:]:
+        common_shops &= s
+
+    if common_shops:
+        shop_score: Dict[str, int] = {}
+        for products in all_results:
+            for p in products:
+                sid = _shop_id(p)
+                if sid in common_shops:
+                    shop_score[sid] = shop_score.get(sid, 0) + 1
+        best_shop = max(common_shops, key=lambda s: shop_score.get(s, 0))
+        think = (
+            f"Found {len(common_shops)} common shop(s) for all {len(sub_queries)} items. "
+            f"Best shop: {best_shop}. Fetching one product per item."
+        )
+    else:
+        all_shop_count: Dict[str, int] = {}
+        for products in all_results:
+            for p in products:
+                sid = _shop_id(p)
+                if sid:
+                    all_shop_count[sid] = all_shop_count.get(sid, 0) + 1
+        if not all_shop_count:
+            return None
+        best_shop = max(all_shop_count, key=lambda s: all_shop_count[s])
+        think = (
+            f"No single shop carries all {len(sub_queries)} item types. "
+            f"Fallback to shop with most coverage: {best_shop}."
+        )
+
+    c["shop_id"] = best_shop
+    n[0] += 1
+    steps.append(create_dialogue_step(
+        think=think, tool_results=[], response="", query=query, step=n[0]
+    ))
+
+    recommendations: List[str] = []
+    for sq in sub_queries:
+        item = _find_best_for_subq(sq, c, steps, n, candidates_pool, best_shop)
+        if item:
+            recommendations.append(item[0])
+
+    if candidates_pool is not None:
+        for products in all_results:
+            candidates_pool.extend(products[:2])
+
+    return recommendations if recommendations else _strategy_shop_known(
+        query, c, steps, n, candidates_pool
+    )
+
+
+def _strategy_shop_known(
+    query: str,
+    c: Dict,
+    steps: List[Dict],
+    n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
+) -> Optional[List[str]]:
+    result = execute_tool_call("find_product", {
+        "q": query, "shop_id": str(c["shop_id"]), "sort": "order"
+    })
+    products = result.get("result") or []
+    products = _hard_filter(products, c, "shop")
+
+    if candidates_pool is not None:
+        candidates_pool.extend(products[:6])
+
+    think = (
+        f"Searched '{query[:50]}' in shop {c['shop_id']}. "
+        f"Found {len(products)} valid products. " + _product_summary(products)
+    )
+    n[0] += 1
+    steps.append(create_dialogue_step(
+        think=think, tool_results=[result], response="", query=query, step=n[0]
+    ))
+    return [_pid(p) for p in products[:3] if _pid(p)] or None
+
+
+def _strategy_shop_discover(
+    query: str,
+    c: Dict,
+    steps: List[Dict],
+    n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
+) -> Optional[List[str]]:
     result = execute_tool_call("find_product", {"q": query, "sort": "order"})
     products = result.get("result") or []
 
     think = (
-        f"I performed a broad search for '{query}' to identify which shop has "
-        f"the most matching products. Found {len(products)} results across shops. "
-        + _product_summary(products, 5)
-        + " I will now identify the shop with the most relevant inventory."
+        f"Broad search '{query[:50]}' to discover best shop. "
+        f"Found {len(products)} results. " + _product_summary(products, 5)
     )
     n[0] += 1
     steps.append(create_dialogue_step(
@@ -564,7 +930,6 @@ def _strategy_shop(
     if not products:
         return None
 
-    # Group by shop and pick the best
     shop_groups: Dict[str, List[Dict]] = {}
     for p in products:
         sid = _shop_id(p)
@@ -577,18 +942,13 @@ def _strategy_shop(
     best_sid = max(shop_groups, key=lambda s: len(shop_groups[s]))
     c["shop_id"] = best_sid
 
-    # Targeted search within best shop
-    result2 = execute_tool_call("find_product", {
-        "q": query, "shop_id": best_sid, "sort": "order",
-    })
+    result2 = execute_tool_call("find_product", {"q": query, "shop_id": best_sid, "sort": "order"})
     shop_products = result2.get("result") or []
 
     think2 = (
-        f"I identified shop ID {best_sid} as having the most matching products "
-        f"({len(shop_groups[best_sid])} found in initial search). "
-        f"I then searched directly within this shop and found {len(shop_products)} products. "
+        f"Shop {best_sid} has most products ({len(shop_groups[best_sid])} in initial search). "
+        f"Targeted search: {len(shop_products)} products. "
         + _product_summary(shop_products or shop_groups[best_sid])
-        + " All recommended products will come from this single shop."
     )
     n[0] += 1
     steps.append(create_dialogue_step(
@@ -596,11 +956,13 @@ def _strategy_shop(
     ))
 
     source = shop_products if shop_products else shop_groups[best_sid]
-    valid  = _hard_filter(source, c, "shop")  # enforce budget + forbidden_kw
-    result = [_pid(p) for p in (valid or source)[:3] if _pid(p)]
+    valid = _hard_filter(source, c, "shop")
     if candidates_pool is not None:
         candidates_pool.extend((valid or source)[:6])
-    return result
+    return [_pid(p) for p in (valid or source)[:3] if _pid(p)]
+
+
+# ─── Strategy: Voucher (V4 — Multi-Product Basket) ───────────────────────────
 
 
 def _strategy_voucher(
@@ -610,46 +972,125 @@ def _strategy_voucher(
     n: List[int],
     candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[str]:
-    """Find a product within budget AFTER applying voucher discount."""
+    """Find products within budget after applying voucher. V4: multi-product basket."""
+    vobj = c.get("voucher_obj")
+    budget = c.get("budget")
+    voucher = c.get("voucher")
+    threshold = float(c.get("voucher_threshold") or 0)
+    voucher_type = c.get("voucher_type", "platform")
 
+    sub_queries = _split_multi_query(query, "voucher")
+
+    if len(sub_queries) >= 2:
+        per_item_max = float(budget) * 2 if budget else 0
+        price_f = f"0-{int(per_item_max)}" if per_item_max else ""
+
+        # Shop-type voucher: find common shop first
+        shop_id = ""
+        if voucher_type == "shop":
+            shop_sets: List[set] = []
+            for sq in sub_queries:
+                r = execute_tool_call("find_product", {"q": sq, "sort": "default"})
+                prods = r.get("result") or []
+                shops = {_shop_id(p) for p in prods if _shop_id(p)}
+                if shops:
+                    shop_sets.append(shops)
+            if shop_sets:
+                common = shop_sets[0].copy()
+                for s in shop_sets[1:]:
+                    common &= s
+                shop_id = list(common)[0] if common else ""
+
+            think = (
+                f"Shop voucher detected for {len(sub_queries)} items. "
+                + (f"Common shop found: {shop_id}." if shop_id else "No common shop.")
+            )
+            n[0] += 1
+            steps.append(create_dialogue_step(
+                think=think, tool_results=[], response="", query=query, step=n[0]
+            ))
+
+        # Find best product for each sub-query
+        basket: List[Tuple[str, float, Dict]] = []
+        for sq in sub_queries:
+            item = _find_best_for_subq(sq, c, steps, n, candidates_pool, shop_id, price_f)
+            if item:
+                basket.append(item)
+            elif shop_id:
+                item = _find_best_for_subq(sq, c, steps, n, candidates_pool, "", price_f)
+                if item:
+                    basket.append(item)
+
+        if basket:
+            total = sum(price for _, price, _ in basket)
+            if vobj:
+                eff = _apply_voucher_obj(total, vobj)
+            elif voucher:
+                eff = _apply_voucher(total, voucher)
+            else:
+                eff = total
+
+            within = not budget or eff <= float(budget) + 0.01
+            activated = total > threshold if threshold else True
+
+            think = (
+                f"Basket ({len(basket)} products): total={total:.2f}. "
+                f"Threshold {threshold:.0f}: {'OK' if activated else 'NOT MET'}. "
+                f"After voucher: {eff:.2f} vs budget {budget}: "
+                f"{'OK' if within else 'OVER'}. "
+                f"Items: {', '.join(f'ID:{pid}@{price:.2f}' for pid, price, _ in basket[:4])}"
+            )
+            n[0] += 1
+            steps.append(create_dialogue_step(
+                think=think, tool_results=[], response="", query=query, step=n[0]
+            ))
+
+            if candidates_pool is not None:
+                candidates_pool.extend(p for _, _, p in basket)
+
+            return ",".join(pid for pid, _, _ in basket)
+
+    # Single-product fallback
+    return _strategy_voucher_single(query, c, steps, n, candidates_pool)
+
+
+def _strategy_voucher_single(
+    query: str,
+    c: Dict,
+    steps: List[Dict],
+    n: List[int],
+    candidates_pool: Optional[List[Dict]] = None,
+) -> Optional[str]:
+    """Single-product voucher strategy (v3 preserved)."""
     budget = c.get("budget")
     voucher = c.get("voucher")
     price_f = _price_filter(c, "voucher")
 
-    think_intro = (
-        f"I am searching for '{query}' with a budget of {budget} "
-        f"and voucher '{voucher}'. "
-        f"I will search with price filter '{price_f}' to find products "
-        f"that fit within the budget after applying the discount."
-    )
-
     result = execute_tool_call("find_product", {
-        "q": quote_plus(query), "sort": "priceasc",
+        "q": query, "sort": "priceasc",
         **({} if not price_f else {"price": price_f}),
     })
     products = result.get("result") or []
 
-    think = think_intro + f" Found {len(products)} products. " + _product_summary(products)
+    think = (
+        f"Voucher search '{query[:50]}' budget={budget} voucher='{voucher}' "
+        f"filter='{price_f}'. Found {len(products)} products. "
+        + _product_summary(products)
+    )
     n[0] += 1
     steps.append(create_dialogue_step(
         think=think, tool_results=[result], response="", query=query, step=n[0]
     ))
 
     if not products:
-        # Fallback: search without price filter, use relevance sort (not priceasc)
-        # to avoid low-relevance cheap items polluting results.
-        # We'll sort by price ourselves in Python after retrieving relevant results.
         result = execute_tool_call("find_product", {"q": query, "sort": "default"})
         products = result.get("result") or []
-        # Sort results by price ascending ourselves for budget-aware ranking
         products = sorted(
             products,
-            key=lambda x: _price_val(x) if _price_val(x) is not None else float("inf")
+            key=lambda x: _price_val(x) if _price_val(x) is not None else float("inf"),
         )
         think = (
-            f"The price-filtered search returned no results. I broadened the search "
-            f"using relevance sort (to avoid irrelevant cheap items) and found "
-            f"{len(products)} products, then sorted by price in Python. "
+            f"No results with price filter — broad search found {len(products)} products. "
             + _product_summary(products)
         )
         n[0] += 1
@@ -660,20 +1101,16 @@ def _strategy_voucher(
     if not products:
         return None
 
-    # Pre-filter: remove hard constraint violations BEFORE view_product_information
-    # This ensures forbidden keywords and wrong shop are caught even if view returns them
     products = _hard_filter(products, c, "voucher")
     if not products:
         return None
 
-    # View details and calculate effective price after voucher
     top = [_pid(p) for p in products[:3] if _pid(p)]
     view_result = execute_tool_call(
         "view_product_information", {"product_ids": ",".join(top)}
     )
     details = view_result.get("result") or []
 
-    # Populate candidates pool for LLM reasoning
     if candidates_pool is not None:
         candidates_pool.extend(details or products[:5])
 
@@ -681,30 +1118,23 @@ def _strategy_voucher(
     best_eff = float("inf")
     verifs = []
 
-    for p in (details or products[:3]):
+    for p in details or products[:3]:
         pid = _pid(p)
         if not pid:
             continue
         price = _price_val(p)
         if price is None:
             continue
-
-        # Hard constraint: forbidden keywords
         content = (_name(p) + " " + str(p.get("attributes") or "")).lower()
         if any(_keyword_match(kw, content) for kw in c.get("forbidden_kw", [])):
-            verifs.append(f"ID:{pid} SKIPPED (forbidden keyword)")
+            verifs.append(f"ID:{pid} SKIP(forbidden)")
             continue
-
-        # Hard constraint: shop
         if c.get("shop_id") and _shop_id(p) != str(c["shop_id"]):
-            verifs.append(f"ID:{pid} SKIPPED (wrong shop)")
+            verifs.append(f"ID:{pid} SKIP(shop)")
             continue
-
-        eff = _apply_voucher(price, voucher) if voucher else price
+        eff = _eff_price(price, c)
         fits = budget is None or eff <= float(budget)
-        verifs.append(
-            f"ID:{pid} original={price:.2f} after_voucher={eff:.2f} fits={fits}"
-        )
+        verifs.append(f"ID:{pid} {price:.2f}->{eff:.2f} {'OK' if fits else 'OVER'}")
         if fits and eff < best_eff:
             best_eff = eff
             best_id = pid
@@ -713,11 +1143,8 @@ def _strategy_voucher(
         best_id = top[0]
 
     think = (
-        f"I retrieved detailed pricing for products {', '.join(top)}. "
-        f"Calculating effective price after applying voucher '{voucher}': "
-        f"{'; '.join(verifs[:3])}. "
-        f"Product {best_id} has the best effective price ({best_eff:.2f}) "
-        f"within the budget of {budget}."
+        f"Verified {len(top)} products: {'; '.join(verifs[:3])}. "
+        f"Best: {best_id} (eff {best_eff:.2f} vs budget {budget})."
     )
     n[0] += 1
     steps.append(create_dialogue_step(
@@ -729,20 +1156,21 @@ def _strategy_voucher(
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
 
+
 def agent_main(problem_data: Dict) -> List[Dict]:
-    """
-    Main entry point for the ORO mining agent.
-    Handles product / shop / voucher problem types.
+    """Main entry point for the ORO mining agent.
+
+    V4: multi-product baskets (shop + voucher), structured voucher parsing,
+    price range extraction, service filters.
     """
     steps: List[Dict] = []
-    n = [0]  # step counter
-    candidates_pool: List[Dict] = []  # collected by strategies for LLM reasoning
+    n = [0]
+    candidates_pool: List[Dict] = []
 
     query = problem_data.get("query", "")
     c = _parse_constraints(problem_data)
     ptype = _detect_type(c)
 
-    # ── Run strategy ──────────────────────────────────────────────────────
     recommended: Optional[str] = None
 
     try:
@@ -756,7 +1184,6 @@ def agent_main(problem_data: Dict) -> List[Dict]:
             recommended = _strategy_product(query, c, steps, n, candidates_pool)
 
     except Exception:  # noqa: BLE001
-        # Graceful fallback: simple search
         try:
             fb = execute_tool_call("find_product", {"q": query})
             prods = fb.get("result") or []
@@ -766,42 +1193,39 @@ def agent_main(problem_data: Dict) -> List[Dict]:
                 n[0] += 1
                 steps.append(create_dialogue_step(
                     think=(
-                        f"I performed a fallback search for '{query}' "
-                        f"and found {len(prods)} products. "
-                        f"I will recommend the top result: {recommended}."
+                        f"Fallback search for '{query}' found {len(prods)} products. "
+                        f"Recommending: {recommended}."
                     ),
                     tool_results=[fb], response="", query=query, step=n[0],
                 ))
         except Exception:  # noqa: BLE001
             pass
 
-    # ── Generate rich LLM reasoning for the final step ─────────────────────
     llm_think = _llm_reason(query, c, candidates_pool, recommended or "", ptype)
 
-    # ── Recommend & terminate ─────────────────────────────────────────────
     if recommended:
         rec = execute_tool_call("recommend_product", {"product_ids": recommended})
         term = execute_tool_call("terminate", {"status": "success"})
 
-        constraints_summary = []
+        cs_parts = []
         if c.get("budget"):
-            constraints_summary.append(f"budget {c['budget']}")
+            cs_parts.append(f"budget {c['budget']}")
         if c.get("shop_id"):
-            constraints_summary.append(f"shop {c['shop_id']}")
+            cs_parts.append(f"shop {c['shop_id']}")
         if c.get("voucher"):
-            constraints_summary.append(f"voucher '{c['voucher']}'")
+            cs_parts.append(f"voucher '{c['voucher']}'")
         if c.get("required_kw"):
-            constraints_summary.append(f"keywords {c['required_kw']}")
-        cs = ", ".join(constraints_summary) if constraints_summary else "none"
+            cs_parts.append(f"keywords {c['required_kw']}")
+        cs = ", ".join(cs_parts) if cs_parts else "none"
 
         n[0] += 1
         steps.append(create_dialogue_step(
             think=llm_think,
             tool_results=[rec, term],
             response=(
-                f"Based on my systematic research for '{query}', "
+                f"Based on my research for '{query}', "
                 f"I recommend product(s) {recommended}. "
-                f"This selection satisfies all constraints ({cs})."
+                f"All constraints satisfied ({cs})."
             ),
             query=query,
             step=n[0],
@@ -811,10 +1235,8 @@ def agent_main(problem_data: Dict) -> List[Dict]:
         n[0] += 1
         steps.append(create_dialogue_step(
             think=(
-                f"After {n[0] - 1} search attempt(s) for '{query}', "
-                f"I was unable to find any product satisfying all constraints. "
-                f"I tried multiple search strategies but none of the results "
-                f"met all the required conditions."
+                f"After {n[0]-1} search attempt(s) for '{query}', "
+                f"unable to find products satisfying all constraints."
             ),
             tool_results=[term],
             response=f"Unable to find products matching all requirements for: {query}.",

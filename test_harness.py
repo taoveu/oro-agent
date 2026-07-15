@@ -65,7 +65,13 @@ class MockProxyClient:
         return str((p.get("item_basic") or {}).get("itemid", ""))
 
     def _find_product(self, params: Dict) -> List[Dict]:
-        query   = params.get("q", "").lower().replace("+", " ").replace("%20", " ")
+        import urllib.parse
+        raw_q   = params.get("q", "")
+        # Full URL decode (handles %27 -> ' etc.)
+        try:
+            query = urllib.parse.unquote_plus(raw_q).lower()
+        except Exception:
+            query = raw_q.lower().replace("+", " ").replace("%20", " ")
         shop_id = str(params.get("shop_id", ""))
         price_f = str(params.get("price", ""))
         sort    = params.get("sort", "default")
@@ -82,8 +88,11 @@ class MockProxyClient:
                 try:
                     lo, hi = price_f.split("-", 1)
                     price = self._norm_price(p)
-                    if price is not None and not (float(lo) <= price <= float(hi)):
-                        continue
+                    if price is not None:
+                        lo_f = float(lo) if lo else 0.0
+                        hi_f = float(hi) if hi else float("inf")
+                        if not (lo_f <= price <= hi_f):
+                            continue
                 except (ValueError, AttributeError):
                     pass
             results.append(p)
@@ -645,6 +654,214 @@ TEST_CASES: List[Dict] = [
             "required_kw": ["electric", "whitening"], "forbidden_kw": ["expired", "broken"],
         },
         "expected_ids": ["P001"], "forbidden_ids": ["P002", "P003", "P004"],
+    },
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # V4 TESTS — Format réel ORO V3 (extraits de l'API live)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── VOUCHER V3 : objet structuré ──────────────────────────────────────────
+    {
+        "id": "TC031", "category": "voucher",
+        "description": "V3 Voucher structuré : fixed discount avec threshold",
+        "trap": "budget=235 dans le voucher_obj. face_value=49, threshold=121. Total doit > 121.",
+        "problem_data": {
+            "query": "Looking for a cream for oily skin that's a single travel size item, and also a beige silicone baby bowl from babypro. My budget is only `235`, but I have a voucher with the following rules:\n1. The voucher applies to all products.\n2. It is valid only when the total price of the products exceeds `121`.\n3. It provides a fixed discount of `49`.",
+            "category": "Voucher",
+            "voucher": {
+                "cap": None,
+                "budget": 235,
+                "discount": None,
+                "threshold": 121,
+                "face_value": 49,
+                "voucher_type": "platform",
+                "discount_type": "fixed",
+                "price_after_voucher": 234.0,
+            },
+        },
+        "products_db": [
+            {"product_id": "CREAM01", "name": "Oily Skin Cream Travel Size", "price": 150.0, "shop_id": "S1", "sold_count": 200},
+            {"product_id": "BOWL01",  "name": "Beige Silicone Baby Bowl BabyPro", "price": 120.0, "shop_id": "S2", "sold_count": 100},
+            {"product_id": "OVER01",  "name": "Luxury Cream XL Size", "price": 300.0, "shop_id": "S3", "sold_count": 50},
+        ],
+        "constraints": {"budget": 235.0, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["CREAM01", "BOWL01"],
+        "forbidden_ids": ["OVER01"],
+    },
+    {
+        "id": "TC032", "category": "voucher",
+        "description": "V3 Voucher structuré : percentage 20% avec cap 147",
+        "trap": "discount=20%, cap=147, threshold=267. Budget=295. Basket >267 requis.",
+        "problem_data": {
+            "query": "I'm looking for black shorts in size large, suitable for sports or the beach. Also, I need a set of 2 coffee cleaning brushes in '2pcs a' color, made of plastic, from the brand Bincoo. My budget is only `295`, but I have a voucher:\n1. It applies to all products.\n2. Valid when total > `267`.\n3. Percentage discount of `20%` with a cap of `147`.",
+            "category": "Voucher",
+            "voucher": {
+                "cap": 147,
+                "budget": 295,
+                "discount": 0.2,
+                "threshold": 267,
+                "face_value": None,
+                "voucher_type": "platform",
+                "discount_type": "percentage",
+                "price_after_voucher": 285.6,
+            },
+        },
+        "products_db": [
+            {"product_id": "SHORTS01", "name": "Black Sports Beach Shorts Large",       "price": 180.0, "shop_id": "S1", "sold_count": 300},
+            {"product_id": "BRUSH01",  "name": "Bincoo Coffee Cleaning Brush 2pcs Plastic", "price": 150.0, "shop_id": "S2", "sold_count": 120},
+            {"product_id": "TOEXP01",  "name": "Premium Shorts XL",                     "price": 400.0, "shop_id": "S3", "sold_count": 10},
+        ],
+        "constraints": {"budget": 295.0, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["SHORTS01", "BRUSH01"],
+        "forbidden_ids": ["TOEXP01"],
+    },
+    {
+        "id": "TC033", "category": "voucher",
+        "description": "V3 Voucher shop-type : tous produits même shop obligatoire",
+        "trap": "voucher_type='shop' → produits du même shop uniquement. S2 a les deux produits.",
+        "problem_data": {
+            "query": "Looking for a pearl white Realme smartphone and a gold Infinix phone. My budget is only `35722`, but I have a voucher:\n1. The voucher only applies to the products from the same shop.\n2. It is valid only when the total price of the products exceeds `34801`.\n3. It provides a fixed discount of `5179`.",
+            "category": "Voucher",
+            "voucher": {
+                "cap": None,
+                "budget": 35722,
+                "discount": None,
+                "threshold": 34801,
+                "face_value": 5179,
+                "voucher_type": "shop",
+                "discount_type": "fixed",
+                "price_after_voucher": 34018.0,
+            },
+        },
+        "products_db": [
+            {"product_id": "REALME01",  "name": "Realme 14 Pro Plus Pearl White",  "price": 20000.0, "shop_id": "TECHSHOP", "sold_count": 150},
+            {"product_id": "INFINIX01", "name": "Infinix Smart 9 Gold",            "price": 15500.0, "shop_id": "TECHSHOP", "sold_count": 100},
+            {"product_id": "CHEAPPH",   "name": "Realme Budget Phone",             "price": 8000.0,  "shop_id": "OTHER",    "sold_count": 500},
+        ],
+        "constraints": {"budget": 35722.0, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["REALME01", "INFINIX01"],
+        "forbidden_ids": ["CHEAPPH"],
+    },
+
+    # ── SHOP V3 : intersection multi-produits ─────────────────────────────────
+    {
+        "id": "TC034", "category": "shop",
+        "description": "V3 Shop multi-produit : intersection de 2 requêtes",
+        "trap": "Trouver le shop qui vend BOTH hair brush AND wallet. Seul SHOPA les vend tous les deux.",
+        "problem_data": {
+            "query": "Find shops offering both a plastic cartoon hair brush without stones, available with LazFlash and priced above 6 PHP, and a polyester cartoon-patterned wallet in color 'a'.",
+            "category": "Shop",
+        },
+        "products_db": [
+            {"product_id": "BRUSH_A", "name": "Kids Cartoon Hair Brush Plastic LazFlash", "price": 14.0, "shop_id": "SHOPA", "sold_count": 200},
+            {"product_id": "WALLET_A","name": "Cartoon Pattern Women Wallet Polyester color a", "price": 51.0, "shop_id": "SHOPA", "sold_count": 150},
+            {"product_id": "BRUSH_B", "name": "Cartoon Hair Brush Plastic", "price": 12.0, "shop_id": "SHOPB", "sold_count": 300},
+            {"product_id": "WALLET_C","name": "Cartoon Wallet Fashion", "price": 45.0, "shop_id": "SHOPC", "sold_count": 80},
+        ],
+        "constraints": {"shop_id": "SHOPA", "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["BRUSH_A", "WALLET_A"],
+        "forbidden_ids": [],
+    },
+    {
+        "id": "TC035", "category": "shop",
+        "description": "V3 Shop multi-produit : 3 variantes Yamaha même shop",
+        "trap": "3 items : black scooter over 1513, white scooter 1889-3315, black motorcycle over 1383. Trouver le shop commun.",
+        "problem_data": {
+            "query": "Find shops offering black Yamaha scooters above 1513 PHP, white Yamaha scooters priced from 1889 to 3315 PHP, and black Yamaha motorcycles over 1383 PHP.",
+            "category": "Shop",
+        },
+        "products_db": [
+            {"product_id": "YAM_BS", "name": "Yamaha Scooter Black 150cc", "price": 2000.0, "shop_id": "YSHOP", "sold_count": 50},
+            {"product_id": "YAM_WS", "name": "Yamaha Scooter White 125cc", "price": 2500.0, "shop_id": "YSHOP", "sold_count": 40},
+            {"product_id": "YAM_BM", "name": "Yamaha Motorcycle Black 250cc", "price": 1800.0, "shop_id": "YSHOP", "sold_count": 30},
+            {"product_id": "OTHER_SCOOT", "name": "Yamaha Scooter Black Cheap", "price": 1600.0, "shop_id": "CHEAPSHOP", "sold_count": 200},
+        ],
+        "constraints": {"shop_id": "YSHOP", "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["YAM_BS", "YAM_WS", "YAM_BM"],
+        "forbidden_ids": [],
+    },
+
+    # ── PRODUCT V3 : prix minimum / plage de prix ─────────────────────────────
+    {
+        "id": "TC036", "category": "product",
+        "description": "V3 Product : prix MINIMUM 'cost over 176 PHP'",
+        "trap": "P001=150 (sous le minimum). Agent doit recommander P002 ou P003 (>176).",
+        "problem_data": {
+            "query": "Show me basic calculators in orange (1 piece) that run on batteries and cost over 176 PHP.",
+            "category": "Product",
+            "constraint_check": {"keywords_present": ["orange"], "keywords_missing": []},
+        },
+        "products_db": [
+            {"product_id": "CALC_A", "name": "Basic Calculator Orange Battery 1 piece", "price": 150.0, "shop_id": "S1", "sold_count": 500},
+            {"product_id": "CALC_B", "name": "Orange Calculator Basic Functions Battery", "price": 200.0, "shop_id": "S2", "sold_count": 200},
+            {"product_id": "CALC_C", "name": "Calculator Orange Standard Battery Pack", "price": 220.0, "shop_id": "S3", "sold_count": 100},
+        ],
+        "constraints": {"required_kw": ["orange"], "forbidden_kw": []},
+        "expected_ids": ["CALC_B", "CALC_C"],
+        "forbidden_ids": ["CALC_A"],
+    },
+    {
+        "id": "TC037", "category": "product",
+        "description": "V3 Product : plage de prix 'priced from 180 to 505 PHP'",
+        "trap": "P001=100 (trop bas), P003=600 (trop haut). Seul P002 dans la plage [180-505].",
+        "problem_data": {
+            "query": "Looking for a hosport brand waist bag for motorcycles, priced from 180 to 505 PHP.",
+            "category": "Product",
+            "constraint_check": {"keywords_present": ["hosport"], "keywords_missing": []},
+        },
+        "products_db": [
+            {"product_id": "BAG_A", "name": "Hosport Motorcycle Waist Bag Small",  "price": 100.0, "shop_id": "S1", "sold_count": 300},
+            {"product_id": "BAG_B", "name": "Hosport Waist Bag Motorcycle Standard","price": 350.0, "shop_id": "S2", "sold_count": 150},
+            {"product_id": "BAG_C", "name": "Hosport Motorcycle Waist Bag Premium", "price": 600.0, "shop_id": "S3", "sold_count": 50},
+        ],
+        "constraints": {"required_kw": ["hosport"], "forbidden_kw": []},
+        "expected_ids": ["BAG_B"],
+        "forbidden_ids": ["BAG_A", "BAG_C"],
+    },
+    {
+        "id": "TC038", "category": "product",
+        "description": "V3 Product : service LazFlash détecté dans query",
+        "trap": "Query mentionne 'LazFlash deals'. Agent doit filtrer service=lazflash.",
+        "problem_data": {
+            "query": "Looking for a waterproof foam roller in the yoga category with LazFlash deals.",
+            "category": "Product",
+            "constraint_check": {"keywords_present": ["foam roller", "waterproof"], "keywords_missing": []},
+        },
+        "products_db": [
+            {"product_id": "ROLL_A", "name": "Waterproof Foam Roller Yoga",  "price": 120.0, "shop_id": "S1", "sold_count": 400, "service": "lazflash"},
+            {"product_id": "ROLL_B", "name": "Foam Roller Standard Yoga",    "price": 80.0,  "shop_id": "S2", "sold_count": 200},
+            {"product_id": "ROLL_C", "name": "Waterproof Yoga Roller Premium","price": 200.0, "shop_id": "S3", "sold_count": 50},
+        ],
+        "constraints": {"required_kw": ["foam roller", "waterproof"], "forbidden_kw": []},
+        "expected_ids": ["ROLL_A", "ROLL_C"],
+        "forbidden_ids": [],
+    },
+    {
+        "id": "TC039", "category": "voucher",
+        "description": "V3 Voucher single-item structuré (pas de multi-query split)",
+        "trap": "budget=82 dans voucher_obj. Single item, threshold=63, fixed=4107 centimes -> 41.07",
+        "problem_data": {
+            "query": "Show me processed cheese options that are a healthier choice. My budget is only `82`, but I have a voucher:\n1. The voucher applies to all products.\n2. It is valid only when the total price of the products exceeds `63`.\n3. It provides a fixed discount of `41.07`.",
+            "category": "Voucher",
+            "voucher": {
+                "cap": None,
+                "budget": 82,
+                "discount": None,
+                "threshold": 63,
+                "face_value": 41.07,
+                "voucher_type": "platform",
+                "discount_type": "fixed",
+                "price_after_voucher": 74.93,
+            },
+        },
+        "products_db": [
+            {"product_id": "CHEESE_A", "name": "Processed Cheese Healthier Choice Light", "price": 75.0, "shop_id": "S1", "sold_count": 200},
+            {"product_id": "CHEESE_B", "name": "Processed Cheese Premium",                "price": 90.0, "shop_id": "S2", "sold_count": 100},
+            {"product_id": "CHEESE_C", "name": "Processed Cheese Budget",                 "price": 50.0, "shop_id": "S3", "sold_count": 400},
+        ],
+        "constraints": {"budget": 82.0, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["CHEESE_A", "CHEESE_B"],
+        "forbidden_ids": [],
     },
 ]
 
