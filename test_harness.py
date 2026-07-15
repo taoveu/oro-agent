@@ -78,7 +78,12 @@ class MockProxyClient:
 
         results = []
         for p in self._db:
-            searchable = (p.get("name", "") + " " + p.get("description", "")).lower()
+            # Real ORO API uses 'title'; also support legacy 'name' for old test data
+            searchable = (
+                p.get("title", "") + " " +
+                p.get("name", "") + " " +
+                p.get("description", "")
+            ).lower()
             words = [w for w in query.split() if len(w) > 2]
             if words and not any(w in searchable for w in words):
                 continue
@@ -862,6 +867,119 @@ TEST_CASES: List[Dict] = [
         "constraints": {"budget": 82.0, "required_kw": [], "forbidden_kw": []},
         "expected_ids": ["CHEESE_A", "CHEESE_B"],
         "forbidden_ids": [],
+    },
+    # ── REAL API FORMAT TESTS (v5 fixes) ──────────────────────────────────────
+    {
+        "id": "TC040", "category": "product",
+        "description": "FORMAT REEL : champ 'title' (pas 'name') comme retourné par l'API ORO",
+        "trap": "Les produits n'ont PAS de champ 'name'. L'agent doit lire 'title'. "
+                "Produit correct = HOSPORT_BAG (title contient 'hosport', 'waist', 'bag').",
+        "problem_data": {
+            "query": "Looking for a hosport brand waist bag for motorcycles, priced from 180 to 505 PHP.",
+            "category": "product",
+            # Pas de constraint_check en prod !
+        },
+        "products_db": [
+            # Format réel ORO : champ 'title', pas 'name'
+            {
+                "product_id": "HOSPORT_BAG",
+                "title": "Waterproof Waist Leg Bag Motorcycle EVA Hard Shell hosport brand",
+                "price": 339.0, "shop_id": "5430924", "sold_count": 2,
+                "service": [],
+            },
+            {
+                "product_id": "CHOCOLATE_BOX",
+                "title": "SWEET LANES CHOCOLATES IN A BOX BUNDLE ALL SET ASSORTED Save 50%",
+                "price": 395.0, "shop_id": "4336156", "sold_count": 7,
+                "service": [],
+            },
+            {
+                "product_id": "STEAM_GIFT",
+                "title": "Steam Wallet Gift Card Philippines Redeemable",
+                "price": 289.0, "shop_id": "5398303", "sold_count": 11,
+                "service": ["freeShipping"],
+            },
+        ],
+        "constraints": {"budget": None, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["HOSPORT_BAG"],
+        "forbidden_ids": ["CHOCOLATE_BOX", "STEAM_GIFT"],
+    },
+    {
+        "id": "TC041", "category": "product",
+        "description": "FORMAT REEL : marque UNIQUEMENT dans 'attributes' (merge find+view requis)",
+        "trap": "Le titre du produit correct ne contient pas 'lancol'. "
+                "La marque 'lancol' n'apparaît que dans attributes.brand (view_product_information). "
+                "L'agent doit merger les données find+view pour scorer correctement.",
+        "problem_data": {
+            "query": "Show me lancol battery testers priced from 1593 to 3846 PHP.",
+            "category": "product",
+        },
+        "products_db": [
+            # Produit correct : 'lancol' uniquement dans attributes (comme l'API réelle)
+            {
+                "product_id": "TF03K",
+                "title": "TF03K Coulomb Meter Vehicle Battery Capacity Tester 8-120V 50A 100A 350A 500A",
+                "price": 1969.0, "shop_id": "36376", "sold_count": 1,
+                "service": ["COD"],
+                "attributes": {"brand": ["lancol"]},
+                "description": "Lancol brand battery capacity tester for electric vehicles.",
+            },
+            # Concurrent trompeur : 'lancol' dans le titre mais mauvais produit
+            {
+                "product_id": "LANCOL_MICRO",
+                "title": "Lancol Micro 500 For 12V 24V Car Battery Tester 40-3000 CCA",
+                "price": 2292.0, "shop_id": "3896337", "sold_count": 1,
+                "service": ["freeShipping"],
+                "attributes": {},
+            },
+            # Produit hors sujet : chocolats avec sold_count élevé (ancien piège)
+            {
+                "product_id": "TOBLERONE",
+                "title": "FREE SHIPPING TOBLERONE 1 BOX WHOLE 20 PCS 100GRAMS",
+                "price": 1895.0, "shop_id": "4336156", "sold_count": 15,
+                "service": [],
+                "attributes": {},
+            },
+        ],
+        "constraints": {"budget": None, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["TF03K", "LANCOL_MICRO"],  # l'un ou l'autre est correct
+        "forbidden_ids": ["TOBLERONE"],
+    },
+    {
+        "id": "TC042", "category": "product",
+        "description": "CLEAN QUERY : prix dans la query NL ne doit pas polluer la recherche",
+        "trap": "La requête NL contient 'priced from 15 to 37 pesos'. "
+                "Sans clean_search_query, l'API retourne des câbles électriques (#14/2c #16/2c). "
+                "Avec clean query = 'car sponge pads pack 10', les bons produits remontent.",
+        "problem_data": {
+            "query": "Looking for car sponge pads, pack of 10, priced from 15 to 37 pesos.",
+            "category": "product",
+        },
+        "products_db": [
+            # Produit correct (sponge pads)
+            {
+                "product_id": "SPONGE_10PK",
+                "title": "10pcs Microfiber Wax Applicator Car Detailing Sponge Foam Polishing Pads",
+                "price": 29.0, "shop_id": "5589097", "sold_count": 86,
+                "service": [],
+            },
+            # Pièges : câbles électriques — aucun mot de la query propre ne matche
+            {
+                "product_id": "WIRE_14_2C",
+                "title": "SHUTA SKY WIRE ROYAL CORD 18/2C 16/2C 14/2C 12/2C 10/2C 60 600V",
+                "price": 18.0, "shop_id": "3102821", "sold_count": 337,
+                "service": ["official", "COD"],
+            },
+            {
+                "product_id": "WIRE_FLAT",
+                "title": "per meter original quality boston powerflex flatcord wire 14/2c 16/2c 18/2c",
+                "price": 18.0, "shop_id": "750489", "sold_count": 457,
+                "service": ["official", "freeShipping"],
+            },
+        ],
+        "constraints": {"budget": None, "required_kw": [], "forbidden_kw": []},
+        "expected_ids": ["SPONGE_10PK"],
+        "forbidden_ids": ["WIRE_14_2C", "WIRE_FLAT"],
     },
 ]
 
