@@ -28,20 +28,24 @@ help:
 setup:
 	@bash scripts/setup.sh
 
-# Run all local tests
+# Run all local tests (validateur renforcé V3 — 39 scénarios)
 test:
-	@echo "🧪 Running all tests..."
-	@python3 test_agent.py --problem all
+	@echo "🧪 Running full test harness (39 scenarios)..."
+	@python3 test_harness.py
 
 # Run specific problem type tests
 test-product:
-	@python3 test_agent.py --problem product
+	@python3 test_harness.py --category product
 
 test-shop:
-	@python3 test_agent.py --problem shop
+	@python3 test_harness.py --category shop
 
 test-voucher:
-	@python3 test_agent.py --problem voucher
+	@python3 test_harness.py --category voucher
+
+# Show only failures
+test-failures:
+	@python3 test_harness.py --fail-only
 
 # Lint and syntax check
 lint:
