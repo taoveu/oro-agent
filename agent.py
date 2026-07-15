@@ -180,15 +180,75 @@ _STOPWORDS = {
 
 def _extract_query_terms(query: str) -> List[str]:
     """Extract meaningful search terms from a natural language query."""
-    clean = re.sub(r"[^\w\s]", " ", query.lower())
+    # Keep hyphens so 'pre-strung' stays as one unit
+    clean = re.sub(r"[^\w\s-]", " ", query.lower())
     words = clean.split()
     terms = [
-        w for w in words
-        if len(w) > 2
-        and w not in _STOPWORDS
-        and not re.match(r"^\d+$", w)
+        w.strip("-")
+        for w in words
+        if len(w.strip("-")) > 2
+        and w.strip("-") not in _STOPWORDS
+        and not re.match(r"^[\d-]+$", w)
     ]
     return terms
+
+
+def _clean_search_query(query: str) -> str:
+    """Extract clean product search terms from a natural language query.
+
+    Removes price ranges, filler phrases, service tags and other non-product
+    text so the search API receives only relevant product keywords.
+
+    Examples:
+      'Looking for a hosport brand waist bag for motorcycles, priced from 180 to 505 PHP.'
+        -> 'hosport brand waist bag for motorcycles'
+      'Show me headlight covers where the cost is above 85 PHP.'
+        -> 'headlight covers'
+      'Looking for car sponge pads, pack of 10, priced from 15 to 37 pesos.'
+        -> 'car sponge pads, pack of 10'
+    """
+    q = query.strip()
+
+    # 1. Remove leading filler phrases
+    q = re.sub(
+        r'^(?:show\s+me\s+|find\s+me\s+|i\s+want\s+|i\s+need\s+'
+        r'|(?:i(?:\'m|\s+am)\s+)?looking\s+for\s+(?:a\s+|an\s+)?)',
+        '', q, flags=re.IGNORECASE,
+    ).strip()
+
+    # 2. Remove price range / cost mentions (many patterns)
+    _PRICE_PATTERNS = [
+        r',?\s*priced?\s+from\s+[\d,]+\s+to\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*(?:that\s+)?cost[s]?\s+(?:between|from)\s+[\d,]+\s+(?:and\s+)?[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*(?:and\s+)?cost[s]?\s+(?:over|above|more\s+than)\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*where\s+the\s+cost\s+is\s+(?:over|above|below|under)\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*priced?\s+(?:over|above|below|under|from)\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*(?:that\s+)?cost[s]?\s+(?:over|above|below|under)\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        r',?\s*(?:at|for)\s+[\d,]+\s+(?:to|and)\s+[\d,]+\s*(?:php|peso[s]?)\.?',
+        # Trailing "and" left over from "and cost between X and Y"
+        r'\s+and\s*$',
+    ]
+    for pat in _PRICE_PATTERNS:
+        q = re.sub(pat, '', q, flags=re.IGNORECASE)
+
+    # 3. Remove service tag mentions
+    q = re.sub(r',?\s*with\s+laz\s*flash\s+deals?\s*\.?', '', q, flags=re.IGNORECASE)
+    q = re.sub(r',?\s*(?:with\s+)?(?:laz\s*flash)\s*\.?', '', q, flags=re.IGNORECASE)
+
+    # 4. Remove "in the X category"
+    q = re.sub(r'\s+in\s+the\s+\w+\s+category\.?', '', q, flags=re.IGNORECASE)
+
+    # 5. Remove "that come/run/are X" descriptive clauses at end
+    q = re.sub(r'\s+that\s+(?:come|run|are|have)\s+\S+', '', q, flags=re.IGNORECASE)
+
+    # 6. Remove parenthetical quantity notes like "(1 piece)"
+    q = re.sub(r'\s*\(\d+\s+(?:piece|pcs?|unit[s]?)\)', '', q, flags=re.IGNORECASE)
+
+    # 7. Final cleanup
+    q = q.strip().rstrip('.,;')
+    q = ' '.join(q.split())
+
+    return q if len(q) > 3 else query
 
 
 def _searchable(p: Dict) -> str:
@@ -448,9 +508,10 @@ def _score_product(p: Dict, c: Dict, problem_type: str) -> float:
             score -= 30.0
 
     # Query term relevance scoring (always active — works in production)
+    # Uses word-boundary matching to avoid false substring matches
     query_terms = c.get("_query_terms") or []
     for term in query_terms:
-        if term in content:
+        if _keyword_match(term, content):
             score += 3.0
 
     # Budget compliance
@@ -591,7 +652,9 @@ def _find_best_for_subq(
     price_f: str = "",
 ) -> Optional[Tuple[str, float, Dict]]:
     """Find best product for one sub-query. Returns (pid, price, product) or None."""
-    params: Dict[str, Any] = {"q": sq, "sort": "default"}
+    # Use clean search terms for better API relevance
+    clean_sq = _clean_search_query(sq)
+    params: Dict[str, Any] = {"q": clean_sq, "sort": "default"}
     if price_f:
         params["price"] = price_f
     if shop_id:
@@ -613,7 +676,7 @@ def _find_best_for_subq(
         products = [p for p in products if _shop_id(p) == shop_id]
 
     think = (
-        f"Searching '{sq[:60]}'"
+        f"Searching '{clean_sq[:60]}'"
         + (f" in shop {shop_id}" if shop_id else "")
         + f" -> {len(products)} results. "
         + (_product_summary(products, 2) if products else "No matches.")
@@ -811,19 +874,22 @@ def _strategy_product(
     n: List[int],
     candidates_pool: Optional[List[Dict]] = None,
 ) -> Optional[str]:
-    """Find ONE product matching all constraints. V5: title field, query-term scoring,
-    merged find+view data for correct scoring."""
+    """Find ONE product matching all constraints. V5.1: clean search query for better
+    API relevance, title field, query-term scoring, merged find+view data."""
     ptype_for_filter = "voucher" if c.get("voucher") or c.get("voucher_obj") else "product"
     price_f = _price_filter(c, ptype_for_filter)
     service = _detect_service(query)
     query_terms = c.get("_query_terms") or _extract_query_terms(query)
 
+    # Clean the NL query to send only product keywords to the API
+    clean_q = _clean_search_query(query)
+
     searches = [
-        {"q": query, "sort": "default", "price": price_f, "service": service},
-        {"q": query, "sort": "order", "price": price_f},
-        {"q": query, "sort": "priceasc", "price": price_f},
+        {"q": clean_q, "sort": "default", "price": price_f, "service": service},
+        {"q": clean_q, "sort": "order", "price": price_f},
+        {"q": clean_q, "sort": "priceasc", "price": price_f},
     ]
-    # If required keywords provided by test harness, add a keyword-focused search
+    # If required keywords from test harness, also search those directly
     if c.get("required_kw"):
         kw_q = " ".join(c["required_kw"][:3])
         searches.append({"q": kw_q, "sort": "order", "price": price_f})
