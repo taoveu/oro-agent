@@ -1,7 +1,25 @@
 """
-ORO Mining Agent — v4
-======================
-Améliorations vs v3 :
+ORO Mining Agent — v5.2
+========================
+v5.2 (2026-07-16) :
+- fix: sélection déterministe du shop commun pour voucher shop-type
+  (list(set)[0] était aléatoire → score par pertinence query-term)
+
+v5.1 (2026-07-16) :
+- fix: _clean_search_query() — supprime prix/filler de la NL query avant find_product
+  (ex: 'priced from 15 to 37 pesos' → câbles électriques; fix → 'car sponge pads')
+- fix: _extract_query_terms() garde les tirets ('pre-strung' reste compound)
+- fix: _score_product() utilise _keyword_match (word-boundary) au lieu de substring
+
+v5.0 (2026-07-15) :
+- fix CRITIQUE: API réelle retourne 'title', pas 'name' → noms vides en prod
+- fix: constraint_check non envoyé en prod → scoring via _extract_query_terms()
+- fix: view_product_information n'a pas de 'price' → candidats skippés en v4
+- fix: sold_count dominant (chocolats battaient les sacs) → poids réduit à 0.05x
+- feat: _merge_product_data() — fusionne find_product (title+price) + view (attributes)
+- feat: _strategy_product() re-score après merge pour décision finale
+
+v4 :
 - Voucher structuré V3 : cap, threshold, voucher_type (platform/shop)
 - Voucher multi-produits : panier N items avec vérification basket total
 - Shop multi-produits : intersection des shops pour N sous-requêtes
