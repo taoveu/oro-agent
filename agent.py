@@ -1,6 +1,11 @@
 """
-ORO Mining Agent — v5.4
+ORO Mining Agent — v5.5
 ========================
+v5.5 (2026-07-16) :
+- fix: appel LLM systématique même quand aucun produit trouvé
+  (avant: branche 'else' utilisait un f-string statique → 0 inference call → Gate 1 fail)
+  (maintenant: llm_think appelé avant le if/else et injecté dans les deux branches)
+
 v5.4 (2026-07-16) — FIX CRITIQUE Gate 1:
 - fix: endpoint LLM '/v1/chat/completions' → '/inference/chat/completions' (proxy ORO)
 - fix: modèle 'google/gemini-2.0-flash' → 'deepseek-ai/DeepSeek-V3.2-TEE' (allowlisté)
@@ -1483,6 +1488,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
         except Exception:  # noqa: BLE001
             pass
 
+    # Appel LLM systématique — Gate 1 exige 1 inference call quel que soit le résultat
     llm_think = _llm_reason(query, c, candidates_pool, recommended or "", ptype)
 
     if recommended:
@@ -1516,10 +1522,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
         term = execute_tool_call("terminate", {"status": "failure"})
         n[0] += 1
         steps.append(create_dialogue_step(
-            think=(
-                f"After {n[0]-1} search attempt(s) for '{query}', "
-                f"unable to find products satisfying all constraints."
-            ),
+            think=llm_think,  # LLM reasoning même en cas d'échec
             tool_results=[term],
             response=f"Unable to find products matching all requirements for: {query}.",
             query=query,
