@@ -851,11 +851,19 @@ def _llm_reason(
 
 
 def _detect_service(query: str) -> str:
+    """Map query keywords to official ORO API service filter values.
+    Official values: 'official', 'freeShipping', 'COD', 'flashsale'
+    """
     q = query.lower()
-    if "lazflash" in q or "laz flash" in q:
-        return "lazflash"
-    if "cash on delivery" in q or "pay on delivery" in q or " cod " in q:
-        return "cod"
+    # LazFlash / flash deals → 'flashsale' (official API value)
+    if "lazflash" in q or "laz flash" in q or "flash deal" in q or "flash sale" in q:
+        return "flashsale"
+    # COD
+    if "cash on delivery" in q or "pay on delivery" in q or " cod " in q or q.endswith(" cod"):
+        return "COD"
+    # Free shipping
+    if "free shipping" in q or "free delivery" in q:
+        return "freeShipping"
     return ""
 
 
