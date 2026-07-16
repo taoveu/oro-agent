@@ -4,23 +4,22 @@
 # =============================================================================
 
 .PHONY: help setup test test-product test-shop test-voucher submit monitor \
-        lint check git-push all
+        lint audit validate validate-product validate-shop validate-voucher \
+        check git-push all
 
 # Default target
 help:
 	@echo ""
 	@echo "ORO Mining Agent — Commands"
 	@echo "═══════════════════════════════════════"
-	@echo "  make setup        Install all dependencies"
-	@echo "  make test         Run all local tests"
-	@echo "  make test-product Test product strategy"
-	@echo "  make test-shop    Test shop strategy"
-	@echo "  make test-voucher Test voucher strategy"
-	@echo "  make lint         Check code quality"
-	@echo "  make submit       Submit agent to ORO network"
-	@echo "  make monitor      Monitor submission status"
-	@echo "  make git-push     Commit & push to GitHub"
-	@echo "  make all          test + submit + git-push"
+	@echo "  make test             Run all local mock tests (42 scénarios)"
+	@echo "  make audit            Audit statique : endpoint, modèle, Gate 1..."
+	@echo "  make validate         Validation réelle contre l'API ORO (30 problems)"
+	@echo "  make validate-product Validation Product uniquement (API réelle)"
+	@echo "  make lint             Syntaxe + audit (alias de make audit)"
+	@echo "  make submit           Soumettre (nécessite audit OK)"
+	@echo "  make monitor          Suivre le statut de soumission"
+	@echo "  make git-push         Commit & push vers GitHub"
 	@echo "═══════════════════════════════════════"
 	@echo ""
 
@@ -28,9 +27,11 @@ help:
 setup:
 	@bash scripts/setup.sh
 
-# Run all local tests (validateur renforcé V3 — 39 scénarios)
+# ── Tests locaux (mocks) ──────────────────────────────────────────────────────
+
+# Run all local tests (validateur renforcé V3 — 42 scénarios)
 test:
-	@echo "🧪 Running full test harness (39 scenarios)..."
+	@echo "🧪 Running full test harness (42 scenarios)..."
 	@python3 test_harness.py
 
 # Run specific problem type tests
@@ -47,21 +48,48 @@ test-voucher:
 test-failures:
 	@python3 test_harness.py --fail-only
 
-# Lint and syntax check
-lint:
-	@echo "🔍 Checking code..."
-	@python3 -m py_compile agent.py && echo "✅ agent.py syntax OK"
-	@python3 -m py_compile test_agent.py && echo "✅ test_agent.py syntax OK"
-	@grep -q "def agent_main" agent.py && echo "✅ agent_main found"
-	@echo "✅ All checks passed"
+# ── Audit statique (Gate 1 + conformité ORO) ──────────────────────────────────
 
-# Submit to ORO network
-submit: lint
+# Audit statique complet — vérifie endpoint, modèle, LLM, imports dangereux
+audit:
+	@echo "🔍 Audit statique agent.py..."
+	@python3 validate_real_api.py --audit-only
+
+# Alias pour compatibilité
+lint: audit
+
+# ── Validation réelle contre l'API ORO ───────────────────────────────────────
+
+# Validation complète (30 vrais problèmes, API réelle)
+validate:
+	@echo "🌐 Validation réelle — API ORO (suite 3, 30 problèmes)..."
+	@python3 validate_real_api.py
+
+# Validation par catégorie
+validate-product:
+	@python3 validate_real_api.py --cat product
+
+validate-shop:
+	@python3 validate_real_api.py --cat shop
+
+validate-voucher:
+	@python3 validate_real_api.py --cat voucher
+
+# Validation rapide (5 premiers problèmes)
+validate-quick:
+	@python3 validate_real_api.py --n 5
+
+# ── Soumission ────────────────────────────────────────────────────────────────
+
+# Submit to ORO network (nécessite audit OK)
+submit: audit
 	@bash scripts/submit.sh
 
 # Monitor submission status
 monitor:
 	@bash scripts/monitor.sh
+
+# ── Git ───────────────────────────────────────────────────────────────────────
 
 # Commit and push to GitHub
 git-push:
@@ -72,14 +100,23 @@ git-push:
 	@git push origin main
 	@echo "✅ Pushed to GitHub"
 
-# Full pipeline: test → submit → push
-all: test submit git-push
+# ── Docker (ORO officiel) ─────────────────────────────────────────────────────
 
 # Docker test (using ORO's official test environment)
 docker-test:
-	@echo "🐳 Running Docker test..."
+	@echo "🐳 Running Docker test (environnement officiel ORO)..."
 	@if [ -d "../.." ] && [ -f "../../docker-compose.yml" ]; then \
 		cd ../.. && docker compose run test; \
 	else \
 		echo "⚠️  ORO repo not found. Clone https://github.com/ORO-AI/oro first."; \
+		echo "   cd .. && git clone https://github.com/ORO-AI/oro && cd oro/agent"; \
 	fi
+
+# ── Pipeline complet ──────────────────────────────────────────────────────────
+
+# Pipeline recommandé avant soumission : mock tests + audit + validation réelle
+pre-submit: test audit validate
+	@echo "✅ Pipeline complet réussi — prêt pour make submit"
+
+# Full pipeline: test → submit → push
+all: test submit git-push
