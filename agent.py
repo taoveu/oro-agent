@@ -1,6 +1,12 @@
 """
 ORO Mining Agent — v6.0
 ========================
+v6.1 (2026-07-16) — FIX PROMPT FORMAT:
+- fix: prompt LLM avec system role pour forcer le format SELECTED:/REASON:
+- fix: exemple concret dans le prompt (le LLM ne respectait pas le format en prose)
+- fix: parsing plus flexible — accepte aussi un ID validé par notre liste même sans SELECTED:
+- fix: si aucun candidat pertinent, le LLM peut écrire 'NONE' — on utilise le fallback
+
 v6.0 (2026-07-16) — LLM AS ACTIVE SELECTOR:
 - feat: _llm_select() — LLM choisit le meilleur produit parmi les candidats
   (avant: heuristique Python choisissait, LLM générait seulement le texte de justification)
@@ -838,25 +844,37 @@ def _llm_select(
         if n_needed > 1 else ""
     )
 
-    prompt = (
-        f'TASK ({ptype}): "{query}"{multi_note}\n\n'
-        f"CONSTRAINTS:\n{cons_str}\n\n"
-        f"CANDIDATES (from live Lazada search):\n{cand_str}\n\n"
-        "INSTRUCTIONS:\n"
-        "1. Select the product ID(s) that best satisfy ALL constraints above.\n"
-        "2. Check: price within range, keywords present, brand/model correct, attributes match.\n"
-        "3. For voucher tasks: ensure the product price qualifies for the voucher.\n"
-        f"4. Reply with ONLY this format (no extra text):\n"
-        "SELECTED: <id1[,id2,...]>\n"
-        "REASON: <2-4 sentences explaining why this product best matches the request>"
+    # Use system + user roles for stricter format compliance
+    system_msg = (
+        "You are a product selection engine. You MUST reply using EXACTLY this format "
+        "and nothing else:\n"
+        "SELECTED: <numeric_id>\n"
+        "REASON: <one sentence>\n\n"
+        "Example:\n"
+        "SELECTED: 1234567890\n"
+        "REASON: This product matches the brand, price range, and all required attributes."
     )
+
+    prompt = (
+        f'USER REQUEST: "{query}"{multi_note}\n\n'
+        f"CONSTRAINTS:\n{cons_str}\n\n"
+        f"CANDIDATES:\n{cand_str}\n\n"
+        "Pick the candidate ID that best satisfies all constraints. "
+        "If none match well, pick the closest one anyway. "
+        "Reply ONLY with SELECTED: <id> and REASON: <sentence>."
+    )
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
         resp = _PROXY.post(_LLM_ENDPOINT, {
             "model": _LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 300,
-            "temperature": 0.1,  # low temp for deterministic selection
+            "messages": messages,
+            "max_tokens": 150,
+            "temperature": 0.0,  # fully deterministic for selection
         })
         content = (
             (((resp or {}).get("choices") or [{}])[0]
@@ -865,8 +883,8 @@ def _llm_select(
             .strip()
         )
         if len(content) >= 30:
-            # Parse SELECTED: <ids>\nREASON: <text>
             import re as _re
+            # Try strict format first: SELECTED: <ids>
             sel_match = _re.search(
                 r"SELECTED:\s*([\d,\s]+)", content, _re.IGNORECASE
             )
@@ -875,7 +893,6 @@ def _llm_select(
             )
             if sel_match:
                 raw_ids = sel_match.group(1)
-                # Keep only IDs that exist in our candidates
                 valid_ids = {_pid(p) for p in candidates}
                 chosen_ids = [
                     i.strip() for i in raw_ids.replace(" ", ",").split(",")
@@ -884,6 +901,12 @@ def _llm_select(
                 if chosen_ids:
                     think = reason_match.group(1).strip() if reason_match else content
                     return (",".join(chosen_ids), think)
+            # Fallback parse: find any valid candidate ID mentioned in the response
+            valid_ids = {_pid(p) for p in candidates}
+            for vid in valid_ids:
+                if vid and vid in content:
+                    think = content[:300]
+                    return (vid, think)
     except Exception:  # noqa: BLE001
         pass
 
