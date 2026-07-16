@@ -1,6 +1,11 @@
 """
-ORO Mining Agent — v5.2
+ORO Mining Agent — v5.3
 ========================
+v5.3 (2026-07-16) :
+- fix: valeurs du filtre 'service' corrects selon la doc officielle ORO
+  'lazflash' → 'flashsale', 'cod' → 'COD', ajout 'freeShipping'
+  (valeurs invalides ignorées silencieusement par l'API)
+
 v5.2 (2026-07-16) :
 - fix: sélection déterministe du shop commun pour voucher shop-type
   (list(set)[0] était aléatoire → score par pertinence query-term)
