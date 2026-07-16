@@ -1,6 +1,12 @@
 """
-ORO Mining Agent — v5.3
+ORO Mining Agent — v5.4
 ========================
+v5.4 (2026-07-16) — FIX CRITIQUE Gate 1:
+- fix: endpoint LLM '/v1/chat/completions' → '/inference/chat/completions' (proxy ORO)
+- fix: modèle 'google/gemini-2.0-flash' → 'deepseek-ai/DeepSeek-V3.2-TEE' (allowlisté)
+  (le mauvais modèle retournait 403 → except → _fallback_think → 0 inference call)
+  (Gate 1 exige 1 appel LLM avec completion_tokens >= 30 sinon score=0 sur tout)
+- fix: seuil min content 150 → 30 chars (aligne sur Gate 1)
 v5.3 (2026-07-16) :
 - fix: valeurs du filtre 'service' corrects selon la doc officielle ORO
   'lazflash' → 'flashsale', 'cod' → 'COD', ajout 'freeShipping'
@@ -826,17 +832,25 @@ def _fallback_think(query: str, c: Dict, chosen: str, ptype: str) -> str:
     )
 
 
+# ORO-allowlisted models (from https://docs.oroagents.com/docs/miners/agent-interface)
+_LLM_MODEL = "deepseek-ai/DeepSeek-V3.2-TEE"
+_LLM_ENDPOINT = "/inference/chat/completions"  # ORO sandbox proxy endpoint
+
+
 def _llm_reason(
     query: str, c: Dict, candidates: List[Dict], chosen: str, ptype: str
 ) -> str:
-    if not chosen:
-        return _fallback_think(query, c, chosen, ptype)
+    """Call the ORO inference proxy to generate LLM reasoning (required for Gate 1).
+
+    Gate 1 requires at least 1 inference call with completion_tokens >= 30.
+    Without this, all problems score 0 regardless of correct product selection.
+    """
     prompt = _build_reasoning_prompt(query, c, candidates, chosen, ptype)
     try:
-        resp = _PROXY.post("/v1/chat/completions", {
-            "model": "google/gemini-2.0-flash",
+        resp = _PROXY.post(_LLM_ENDPOINT, {
+            "model": _LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 400,
+            "max_tokens": 512,
             "temperature": 0.3,
         })
         content = (
@@ -845,10 +859,11 @@ def _llm_reason(
              .get("content", "") or "")
             .strip()
         )
-        if len(content) >= 150:
+        if len(content) >= 30:  # Gate 1: completion_tokens >= 30
             return content
     except Exception:  # noqa: BLE001
         pass
+    # Fallback: structured reasoning if LLM unavailable
     return _fallback_think(query, c, chosen, ptype)
 
 
