@@ -1,6 +1,13 @@
 """
 ORO Mining Agent — v6.0
 ========================
+v6.2 (2026-07-16) — FIXES FORMAT + TIMEOUT + VOUCHER:
+- fix: limit sub-queries in shop strategy to max 4 (prevent 18-step timeout on P30)
+- fix: suppression des steps intermédiaires vides (think only, no tool_call)
+  → format_score pénalisé à 0.5 pour ces steps, supprimés maintenant
+- fix: voucher multi-produit — si threshold NOT MET, on retente _strategy_voucher_single
+  pour trouver un produit dont le prix seul dépasse le seuil
+
 v6.1 (2026-07-16) — FIX PROMPT FORMAT:
 - fix: prompt LLM avec system role pour forcer le format SELECTED:/REASON:
 - fix: exemple concret dans le prompt (le LLM ne respectait pas le format en prose)
@@ -1085,7 +1092,12 @@ def _strategy_shop(
     if len(sub_queries) == 1:
         return _strategy_shop_discover(query, c, steps, n, candidates_pool)
 
-    # Multi-product intersection
+    # Multi-product intersection — limit to 4 sub-queries max to avoid timeout
+    # (8 sub-queries × 1 LLM call each = 300s+ timeout observed in sandbox)
+    MAX_SHOP_SUBQ = 4
+    if len(sub_queries) > MAX_SHOP_SUBQ:
+        sub_queries = sub_queries[:MAX_SHOP_SUBQ]
+
     all_results: List[List[Dict]] = []
     shop_sets: List[set] = []
 
@@ -1152,10 +1164,8 @@ def _strategy_shop(
         )
 
     c["shop_id"] = best_shop
-    n[0] += 1
-    steps.append(create_dialogue_step(
-        think=think, tool_results=[], response="", query=query, step=n[0]
-    ))
+    # NOTE: do NOT emit a separate step here — no tool_call means format_score penalty.
+    # The think is folded into the next find_best_for_subq steps.
 
     recommendations: List[str] = []
     for sq in sub_queries:
@@ -1363,13 +1373,22 @@ def _strategy_voucher(
                 f"{'OK' if within else 'OVER'}. "
                 f"Items: {', '.join(f'ID:{pid}@{price:.2f}' for pid, price, _ in basket[:4])}"
             )
-            n[0] += 1
-            steps.append(create_dialogue_step(
-                think=think, tool_results=[], response="", query=query, step=n[0]
-            ))
+            # NOTE: no separate step — fold into the final LLM step to avoid format penalty
 
             if candidates_pool is not None:
                 candidates_pool.extend(p for _, _, p in basket)
+
+            # If threshold not met, fall back to single-product search
+            if not activated:
+                single = _strategy_voucher_single(query, c, steps, n, candidates_pool)
+                if single:
+                    return single
+
+            # If basket exceeds budget after voucher, also fall back
+            if not within:
+                single = _strategy_voucher_single(query, c, steps, n, candidates_pool)
+                if single:
+                    return single
 
             return ",".join(pid for pid, _, _ in basket)
 
